@@ -123,7 +123,9 @@ if (problems.length) console.log(problems.slice(0, 5));
 
   // --- memory management ----------------------------------------------------
   const settle = () => new Promise((r) => setTimeout(r, 200));   // frames are processed asynchronously
-  bot.config.board.loadWait = 0;
+  // The stub server never answers, so keep every wait short
+  const fastConfig = () => bot.setConfig({ board: { loadWait: 0, loadQuiet: 0 }, solver: { confirmTimeout: 30 } });
+  fastConfig();
   bot.chunks.clear();                                            // leftovers from the solver boards above
   await bot.loadChunks([[0, 0], [1, 0], [2, 0]], { quiet: true });
   await bot.cleanup({ keepView: false });
@@ -160,7 +162,7 @@ if (problems.length) console.log(problems.slice(0, 5));
   // pickNearestToStart and crash the tab with out-of-memory after the first area.
   const withTimeout = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(() => r('TIMEOUT'), ms))]);
   bot.resetConfig();
-  bot.config.board.loadWait = 0;
+  fastConfig();
   bot.config.logging.actions = false;
   ok('the defaults really use unbounded search limits',
      bot.config.auto.maxRadius === Infinity && bot.config.auto.maxRings === Infinity);
@@ -169,34 +171,127 @@ if (problems.length) console.log(problems.slice(0, 5));
     bot.chunks.clear();
     const r = await withTimeout(bot.autoSolve(20, { center: [0, 0], mode }), 20000);
     ok(`autoSolve (${mode}) gives up on an empty board instead of searching forever`,
-       r !== 'TIMEOUT' && r?.areas === 1);
+       r !== 'TIMEOUT' && r?.areas === 1 && r.endReason === 'blankGap' && bot.lastRun.endReason === 'blankGap');
     bot.stopSolve();
   }
 
   // ...but still travels to real work: a finished 0 with eight hidden neighbours
   // at global (x, 10), with an untouched gap between it and the start
-  async function farWork(x, mode) {
+  async function farWork(x, mode, opts = { maxAreas: 2 }) {
     await settle();                                       // let the last run's unsubscribes finish first
     bot.chunks.clear();
     const chunk = new Uint8Array(CHUNK * CHUNK);
     chunk[10 * CHUNK + (x % CHUNK)] = 2;
     bot.chunks.set(`${Math.floor(x / CHUNK)},0`, chunk);
-    return withTimeout(bot.autoSolve(20, { center: [0, 0], mode, maxAreas: 2 }), 20000);
+    return withTimeout(bot.autoSolve(20, { center: [0, 0], mode, ...opts }), 20000);
   }
   for (const mode of ['nearest', 'mostWork']) {
     const near = await farWork(30, mode);
     ok(`autoSolve (${mode}) finds work a couple of areas away with the defaults`,
        near !== 'TIMEOUT' && near.areas === 2 && near.chords + near.reveals >= 1);
     const gap = await farWork(100, mode);
-    ok(`autoSolve (${mode}) gives up when the gap is wider than giveUpAfterEmpty`, gap !== 'TIMEOUT' && gap.areas === 1);
+    ok(`autoSolve (${mode}) gives up when the gap is wider than giveUpAfterEmpty`, gap !== 'TIMEOUT' && gap.areas === 1 && gap.endReason === 'blankGap');
     bot.setConfig({ auto: { giveUpAfterEmpty: 10 } });
     const wide = await farWork(100, mode);
     ok(`autoSolve (${mode}) crosses the same gap once giveUpAfterEmpty is raised`,
        wide !== 'TIMEOUT' && wide.areas === 2 && wide.chords + wide.reveals >= 1);
     bot.resetConfig();
-    bot.config.board.loadWait = 0;
+    fastConfig();
     bot.config.logging.actions = false;
   }
+  await bot.cleanup({ keepView: false });
+
+  // --- waiting for chunk snapshots -------------------------------------------
+  // "No data yet" is ambiguous (untouched chunks never get a snapshot, busy ones are slow).
+  const timed = async (fn) => { const t = Date.now(); const r = await fn(); return [r, Date.now() - t]; };
+  bot.setConfig({ board: { loadWait: 0, loadQuiet: 600, loadMaxWait: 3000 } });
+  bot.pendingSnapshots.add('90,90');
+  setTimeout(() => bot.pendingSnapshots.delete('90,90'), 250);
+  let [w, ms] = await timed(() => bot.waitForSnapshots(['90,90']));
+  ok('a slow snapshot is waited for, not mistaken for an empty chunk',
+     w.arrived === 1 && w.presumedEmpty === 0 && w.incomplete === 0 && ms < 550);
+
+  bot.setConfig({ board: { loadQuiet: 100 } });
+  bot.pendingSnapshots.add('91,91');
+  [w, ms] = await timed(() => bot.waitForSnapshots(['91,91']));
+  ok('a chunk that stays silent once the server goes quiet is presumed untouched',
+     w.presumedEmpty === 1 && bot.presumedEmpty.has('91,91') && !bot.pendingSnapshots.has('91,91') && ms >= 90);
+
+  bot.setConfig({ board: { loadQuiet: 10000, loadMaxWait: 150 } });
+  bot.pendingSnapshots.add('92,92');
+  [w, ms] = await timed(() => bot.waitForSnapshots(['92,92']));
+  ok('a chunk still silent at loadMaxWait is marked unknown, not empty',
+     w.incomplete === 1 && bot.incompleteChunks.has('92,92') && !bot.presumedEmpty.has('92,92'));
+  bot.presumedEmpty.clear(); bot.incompleteChunks.clear();
+
+  // The final re-check gives slow chunks another, longer chance before a run gives up
+  bot.setConfig({ board: { loadWait: 0, loadQuiet: 5000, loadMaxWait: 3000 } });
+  await settle();
+  bot.presumedEmpty.add('0,0');
+  const late = new Uint8Array(CHUNK * CHUNK);
+  late[10 * CHUNK + 30] = 2;                                     // a finished 0 at (30, 10)
+  setTimeout(() => { bot.chunks.set('0,0', late); bot.pendingSnapshots.delete('0,0'); }, 120);   // the snapshot finally lands
+  const re = await bot.recheckSlowChunks([{ rect: [22, -10, 41, 9], result: (n) => ({ center: [32, 0], work: n }) }]);
+  ok('the re-check finds work in a chunk that answered late', re.found?.work === 3 && re.rechecked === 1);
+  bot.presumedEmpty.clear();
+
+  // --- progress checks retry instead of aborting -----------------------------
+  async function stallRun(confirmTimeout, confirmAfter) {
+    await settle();
+    fastConfig();
+    bot.setConfig({ solver: { confirmTimeout } });
+    bot.chunks.clear();
+    const chunk = new Uint8Array(CHUNK * CHUNK);
+    chunk[10 * CHUNK + 30] = 2;                                  // three safe reveals along y = 9
+    bot.chunks.set('0,0', chunk);
+    if (confirmAfter) setTimeout(() => { for (const x of [29, 30, 31]) chunk[9 * CHUNK + x] = 9; }, confirmAfter);   // revealed as 7s: no follow-up work
+    return timed(() => bot.solveArea(20, { center: [32, 0] }));
+  }
+  let [sr, sms] = await stallRun(60, 0);
+  ok('actions that never show up end the area as stalled, after several tries',
+     sr.code === 'stalled' && sms >= 150 && bot.lastRun.endReason === 'stalled');
+  [sr, sms] = await stallRun(1500, 200);
+  ok('a slow confirmation is waited for: no stall, the area carries on', sr.code === 'stuck' && sms < 1400);
+
+  // --- a run that cannot load anything says so instead of searching forever ---
+  await settle();
+  fastConfig();
+  bot.setConfig({ board: { loadQuiet: 10000, loadMaxWait: 120 } });
+  bot.chunks.clear();
+  const nl = await withTimeout(bot.autoSolve(20, { center: [0, 0], mode: 'nearest' }), 60000);
+  ok('when no chunk data arrives the run ends as chunksNotLoading',
+     nl !== 'TIMEOUT' && nl.endReason === 'chunksNotLoading' && bot.lastRun.endReason === 'chunksNotLoading');
+  bot.presumedEmpty.clear(); bot.incompleteChunks.clear();
+
+  // --- every way a run can end is reported -------------------------------------
+  await settle();
+  fastConfig();
+  const lines = [];
+  const realLog = console.log;
+  console.log = (...a) => { lines.push(a.join(' ')); realLog(...a); };
+  bot.chunks.clear();
+  const ended = async (size, opts) => { await settle(); bot.chunks.clear(); return withTimeout(bot.autoSolve(size, opts), 20000); };
+  const rMax = await farWork(30, 'nearest', { maxAreas: 1 });
+  const rStall = await farWork(30, 'mostWork', {});
+  const rRadius = await ended(20, { center: [0, 0], mode: 'nearest', maxRadius: 1 });
+  const rRings = await ended(20, { center: [0, 0], mode: 'mostWork', maxRings: 1 });
+  console.log = realLog;
+  ok('maxAreas is reported', rMax.endReason === 'maxAreas');
+  ok('a stalled run is reported', rStall.endReason === 'stalled');
+  ok('maxRadius exhausted is reported', rRadius.endReason === 'radiusLimit');
+  ok('maxRings exhausted is reported', rRings.endReason === 'ringLimit');
+  ok('each run prints an [auto] ENDED line naming the reason and explaining it',
+     ['maxAreas', 'stalled', 'radiusLimit', 'ringLimit'].every((r) =>
+       lines.some((l) => l.startsWith(`[auto] ENDED (${r})`) && l.length > `[auto] ENDED (${r}) after 0 min: `.length + 10)));
+
+  await settle();
+  fastConfig();
+  bot.setConfig({ solver: { confirmTimeout: 5000 } });
+  setTimeout(() => bot.stopSolve(), 300);
+  const [rStop, stopMs] = await timed(() => farWork(30, 'nearest', {}));
+  ok('stopSolve() ends the run promptly and says it was stopped',
+     rStop.endReason === 'stopped' && stopMs < 3000 && /stopSolve/.test(bot.lastRun.detail));
+
   await bot.cleanup({ keepView: false });
 
   console.log(fails ? `\n${fails} FAILURE(S)` : '\nall checks passed');

@@ -17,6 +17,7 @@ commands.
 - [Commands](#commands)
 - [Configuration](#configuration)
 - [How it works](#how-it-works)
+- [How runs end](#how-runs-end)
 - [Memory](#memory)
 - [The solver](#the-solver)
 - [Click mode](#click-mode)
@@ -82,6 +83,7 @@ unhooks the old one first.
 | `await solveArea(size, opts)` | Repeat passes over one area until it is solved or stuck. |
 | `await autoSolve(size, opts)` | Solve an area, move to the next area with work, repeat. The main entry point. |
 | `stopSolve()` | Stop the running solver after the action in flight. |
+| `msbot.lastRun` | Summary of the last solver run: command, `endReason`, `detail` (why it ended), totals, when. |
 
 Options (each defaults to the matching setting in the config): `delay`, `passWait` and
 `center: [x, y]` everywhere; `maxPasses` on `solveArea` and `autoSolve`; `dryRun` on `solveRadius`;
@@ -93,9 +95,29 @@ await autoSolve(40, { mode: 'mostWork', maxAreas: 10 });
 await autoSolve(60, { delay: 120, passWait: 500 });   // bigger areas, gentler pacing
 ```
 
-`solveArea` returns `{ status, passes, flags, chords, reveals, hiddenLeft }`; `status` is `solved`,
-`stuck (needs a guess)`, `stopped`, `hit a mine (stopped to be safe)`, `no progress (actions not
-taking effect)` or `max passes reached`.
+`solveArea` returns `{ code, status, passes, flags, chords, reveals, hiddenLeft }`. `code` and `status`
+are one of: `solved`; `stuck` (*stuck (needs a guess)*); `stopped`; `hitMine` (*hit a mine (stopped to
+be safe)*); `stalled` (*stalled (actions not taking effect)*); `maxPasses`; `unloaded` (*chunks did not
+load*); `disconnected` (*game connection closed*). Anything other than `solved` / `stuck` also prints a
+`why:` line.
+
+### How runs end
+
+Nothing stops silently. When `autoSolve` finishes it prints an `[auto] ENDED (<reason>)` line with an
+explanation, then a totals line, and keeps the summary in `msbot.lastRun`; the return value has
+`endReason` and `endDetail`.
+
+| `endReason` | Why the run ended | What to do |
+| --- | --- | --- |
+| `stopped` | `stopSolve()` was called, or the bot was re-pasted / `dispose()`d. | Nothing; run it again when ready. |
+| `maxAreas` | It did the `maxAreas` areas you asked for. | Nothing. |
+| `blankGap` | `auto.giveUpAfterEmpty` rings/bands of areas in a row had nothing revealed in them (after a final re-check of slow chunks). The line says how far out it looked. | Raise `auto.giveUpAfterEmpty`, or start closer to the next revealed region with `{ center: [x, y] }`. |
+| `radiusLimit` / `ringLimit` | Everything within `auto.maxRadius` (`nearest`) or `auto.maxRings` (`mostWork`) was checked and has no safe move. | Raise the limit, or accept that the region is done. |
+| `chunksNotLoading` | The server sent nothing for chunks it should have (the run named how many areas or bands), even after retrying. | Check the connection and `boardStatus()`; raise `board.loadMaxWait`. |
+| `stalled` | Actions went out but the board never showed any of them taking effect, for `solver.maxStalledPasses` passes that each waited `solver.confirmTimeout`. | Rate limit, lag or a dead connection: raise `solver.actionDelay`, check `boardStatus()`. |
+| `disconnected` | The game WebSocket closed. | Wait for the game to reconnect or reload, re-paste, run again. |
+| `hitMine` | A reveal opened a mine. It should never happen. | Look at the board around the last actions before running again. |
+| `error` | An exception was thrown; the stack is in the console. | Report it with `msbot.stats`. |
 
 ### Config
 
@@ -134,7 +156,9 @@ into `config.defaults.js`). Run it whenever you change a default.
 | `passSize` | `20` | Default square size for `solveRadius()`. |
 | `areaSize` | `100` | Default square size for `solveArea()` and `autoSolve()`. |
 | `actionDelay` | `10` | ms between two actions. Lower is faster and noisier for other players. |
-| `passWait` | `20` | ms cap on waiting for the server to confirm a pass. It moves on as soon as every action is confirmed, so this only matters when something is dropped. |
+| `passWait` | `20` | ms cap on waiting for the server to confirm a pass before planning the next one. It moves on as soon as every action is confirmed. A low value is fine: a pass that shows no confirmation yet is not treated as failed, see `confirmTimeout`. |
+| `confirmTimeout` | `3000` | When a pass shows no sign of taking effect, keep looking for any confirmation for this long before counting it as stalled. |
+| `maxStalledPasses` | `3` | End the area (`stalled`) after this many stalled passes in a row. Each stalled pass re-plans and sends its actions again. |
 | `maxPasses` | `1000` | Give up on one area after this many passes. |
 
 **`auto`** — how `autoSolve()` travels
@@ -145,6 +169,7 @@ into `config.defaults.js`). Run it whenever you change a default.
 | `overlapRatio` | `0.2` | Neighbouring areas overlap by `round(size * ratio)` cells, so deductions that need cells from both still happen. |
 | `maxRings` | `Infinity` | `mostWork`: how many rings of candidate areas to search outward before giving up. `Infinity` is safe: `giveUpAfterEmpty` ends the search. |
 | `maxRadius` | `Infinity` | `nearest`: how many areas out from the start to consider. `Infinity` is safe: `giveUpAfterEmpty` ends the search. |
+| `maxUnloadedAreas` | `3` | End the run (`chunksNotLoading`) after this many areas in a row whose chunks never loaded. |
 | `giveUpAfterEmpty` | `3` | Stop searching after this many rings (`mostWork`) or bands (`nearest`) of areas in a row with nothing revealed in them. This is what ends the search when `maxRings` / `maxRadius` are `Infinity`. One step is `areaSize` minus the overlap, so at size 40 the default tolerates a blank gap of roughly 100 cells; raise it to cross wider gaps. |
 | `maxAreas` | `Infinity` | Stop after this many areas. |
 | `keepMargin` | `4` | Extra chunks kept subscribed around the next area when releasing the rest. |
@@ -154,7 +179,9 @@ into `config.defaults.js`). Run it whenever you change a default.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `loadRadius` | `1` | Default radius for `loadAround()`; `1` is the 3x3 block of chunks. |
-| `loadWait` | `500` | ms to wait for snapshots after subscribing. Raise it on a slow connection if chunks stay `?`. |
+| `loadWait` | `500` | Minimum ms to wait after subscribing before concluding that chunks which sent nothing are untouched. |
+| `loadQuiet` | `300` | ...and how long (ms) the server must go quiet — no snapshot at all — before it concludes that. Raise both on a slow connection if areas look empty that aren't. |
+| `loadMaxWait` | `5000` | Give up on a load after this long. Chunks still silent are marked *unknown*, never empty, and are retried. |
 | `solverPadding` | `2` | Cells of context loaded around a solved rectangle, so numbers just outside it still constrain cells inside. |
 
 **`memory`** — see [Memory](#memory)
@@ -214,6 +241,13 @@ players' moves as they happen.
 does what the game does when scrolling: unsubscribe, then subscribe again. Chunks the bot
 subscribed to are tracked separately from the game's own subscriptions (and stamped for LRU), and
 are released when no longer needed — never one the game is displaying. See [Memory](#memory).
+
+The server sends no snapshot at all for a chunk nobody has touched, so "no data yet" could mean either
+*untouched* or *slow*. The bot therefore waits until every snapshot has arrived, or until the server has
+been silent for `board.loadQuiet` ms (after at least `board.loadWait`), and only then presumes the rest
+untouched. Chunks that stay silent until `board.loadMaxWait` are marked *unknown*, and the solver never
+treats an unknown chunk as empty or marks an area stuck because of it. Before a run gives up on a blank
+stretch of board, it asks once more, more patiently, for the chunks in it that were slow to answer.
 
 **Acting.** Every action goes through `act()`, which either simulates a click (click mode) or sends
 an action message directly. Frames the bot builds are tagged in a `WeakSet` so the log can tell
@@ -359,7 +393,8 @@ Other details:
 | `received` climbs but `snapshots` and `patches` stay `0` | The protocol changed, or the frames aren't being decoded. Check `stats.lastError`. |
 | `detached` is climbing | Frames arrived already emptied and the board may be missing updates. Reload and re-paste. |
 | `autoSolve` stops with "no area with a safe move found within range" | Nothing solvable within `maxRadius` / `maxRings`, or a blank gap wider than `auto.giveUpAfterEmpty` steps separates you from more work. Raise `giveUpAfterEmpty`, or move closer and pass `{ center: [x, y] }`. |
-| Solver reports `no progress (actions not taking effect)` | Likely rate-limited or the socket dropped. Slow down (`solver.actionDelay`) and check `boardStatus()`. |
+| `autoSolve` ends `stalled` | Actions went out but never showed on the board, several passes in a row. Likely rate-limited or the socket dropped: slow down (`solver.actionDelay`) and check `boardStatus()`. |
+| A run ended and you don't know why | `msbot.lastRun` and the `[auto] ENDED (...)` line say. See [How runs end](#how-runs-end). |
 | Tab gets slow over a long run | `memoryStatus()`; lower `memory.maxScriptChunks`, run `await cleanup()`, `console.clear()`, or `await resyncUI()`. See [Memory](#memory). |
 | Cells read `?` after a solver finished | `releaseOnFinish` freed them. `await loadAround()` again, or turn the setting off. |
 | Score in the page doesn't move | Expected for direct messages; run `await resyncUI()`. `msbot.stats.score` has the real value. |

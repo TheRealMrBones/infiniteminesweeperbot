@@ -49,7 +49,9 @@ const CONFIG = {
     passSize: 20,            // default square size for solveRadius()
     areaSize: 100,           // default square size for solveArea() / autoSolve()
     actionDelay: 10,         // ms between two actions sent to the server
-    passWait: 20,            // ms to wait for the server to confirm a pass's actions
+    passWait: 20,             // ms to wait for the server to confirm a pass's actions before planning the next pass
+    confirmTimeout: 3000,     // ms to keep waiting for ANY confirmation before counting a pass as stalled
+    maxStalledPasses: 3,      // end the area after this many stalled passes in a row
     maxPasses: 1000,         // give up on an area after this many passes
   },
   auto: {
@@ -57,13 +59,16 @@ const CONFIG = {
     overlapRatio: 0.2,       // neighbouring areas overlap by round(size * this)
     maxRings: Infinity,      // 'mostWork': how many rings of areas to search outward
     maxRadius: Infinity,     // 'nearest': how many areas out from the start to consider
-    giveUpAfterEmpty: 3,     // stop looking after this many rings/bands of areas with nothing revealed in them (bounds an Infinity radius)
+    giveUpAfterEmpty: 3,      // stop looking after this many rings/bands of areas with nothing revealed in them (bounds an Infinity radius)
+    maxUnloadedAreas: 3,      // end the run after this many areas in a row whose chunks never loaded
     maxAreas: Infinity,      // stop after this many areas
     keepMargin: 4,           // extra chunks kept loaded around the next area
   },
   board: {
     loadRadius: 1,           // default radius (in chunks) for loadAround()
-    loadWait: 500,           // ms to wait for chunk snapshots after subscribing
+    loadWait: 500,            // minimum ms to wait after subscribing before deciding the chunks that sent nothing are untouched
+    loadQuiet: 300,           // ...and how long (ms) the server must stay silent before deciding that
+    loadMaxWait: 5000,        // give up on a load after this long; chunks still missing are treated as unknown, not empty
     solverPadding: 2,        // cells of context loaded around a solved rectangle
   },
   memory: {
@@ -114,6 +119,8 @@ const DEFAULT_CONFIG = {
     areaSize: 100,
     actionDelay: 10,
     passWait: 20,
+    confirmTimeout: 3000,
+    maxStalledPasses: 3,
     maxPasses: 1000,
   },
   auto: {
@@ -122,12 +129,15 @@ const DEFAULT_CONFIG = {
     maxRings: Infinity,
     maxRadius: Infinity,
     giveUpAfterEmpty: 3,
+    maxUnloadedAreas: 3,
     maxAreas: Infinity,
     keepMargin: 4,
   },
   board: {
     loadRadius: 1,
     loadWait: 500,
+    loadQuiet: 300,
+    loadMaxWait: 5000,
     solverPadding: 2,
   },
   memory: {
@@ -237,6 +247,12 @@ const gameSubs = new Set();         // chunks the game itself subscribed to
 const scriptChunks = new Set();     // chunks this script subscribed to
 const chunkTouched = new Map();     // script chunk key -> tick of last use (for LRU pruning)
 let touchTick = 0;
+const pendingSnapshots = new Set(); // chunks asked for whose snapshot hasn't arrived yet
+const presumedEmpty = new Set();    // chunks that sent no snapshot before the server went quiet (assumed untouched)
+const incompleteChunks = new Set(); // chunks still silent after board.loadMaxWait: unknown, NOT empty
+let lastSnapshotAt = 0;             // when the last chunk snapshot arrived
+let stopWhy = '';                   // why the current solver run was asked to stop
+let lastRun = null;                 // summary of the last solver run and why it ended
 const scriptSent = new WeakSet();   // outgoing frames this script created
 const seenEvents = new WeakSet();   // MessageEvents already copied
 
@@ -253,7 +269,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const stats = {
   sent: 0, received: 0, snapshots: 0, patches: 0, patchesForUnloadedChunks: 0,
   detached: 0, errors: 0, lastError: null, score: null, lastPoints: null,
-  clicksExact: 0, clicksCorrected: 0, clickTimeouts: 0, clickFallbacks: 0, gameActionsBlocked: 0,
+  chunksPresumedEmpty: 0, chunksIncomplete: 0, clicksExact: 0, clicksCorrected: 0, clickTimeouts: 0, clickFallbacks: 0, gameActionsBlocked: 0,
 };
 
 // Keep the pristine browser functions across re-pastes so hooks never stack
@@ -276,6 +292,7 @@ function dispose(reason = 'disposed') {
   if (disposed) return;
   disposed = true;
   stopRequested = true;                     // let any running solver finish its action and stop
+  stopWhy = `the bot was unhooked (${reason})`;
   WebSocket.prototype.send = ORIGINAL.send;
   Object.defineProperty(MessageEvent.prototype, 'data',
     { configurable: true, enumerable: true, get: ORIGINAL.messageData });
@@ -433,7 +450,10 @@ function handleIncoming(type, body) {
       const o = toObj(entry);
       const [cx, cy] = readChunk(o[1]);
       if (o[3] && o[3].length === CHUNK * CHUNK) {
-        chunks.set(chunkKey(cx, cy), Uint8Array.from(o[3]));
+        const k = chunkKey(cx, cy);
+        chunks.set(k, Uint8Array.from(o[3]));
+        pendingSnapshots.delete(k); presumedEmpty.delete(k); incompleteChunks.delete(k);
+        lastSnapshotAt = Date.now();
         stats.snapshots++;
       }
     }
@@ -468,7 +488,7 @@ function handleOutgoing(type, body, source) {
     for (const [f, v] of fields(body)) {
       if (f !== 1) continue;
       const k = chunkKey(...readChunk(v));
-      if (source === 'manual') gameSubs.delete(k);
+      if (source === 'manual') { gameSubs.delete(k); presumedEmpty.delete(k); incompleteChunks.delete(k); }
       chunks.delete(k);
     }
   } else if (type === 5) {                    // the game reporting where you are
@@ -527,17 +547,61 @@ const chunkListMsg = (list) => list.flatMap(([cx, cy]) => bField(1, chunkMsg(cx,
 
 // Fetch fresh snapshots for a list of [cx, cy] chunks. The server doesn't resend
 // snapshots for chunks this connection already watches, so do what the game does
-// when scrolling: unsubscribe, then subscribe again.
-async function loadChunks(list, { quiet = false } = {}) {
+// when scrolling: unsubscribe, then subscribe again. Then wait for the data (see
+// waitForSnapshots). `patient` waits longer, for re-checks.
+async function loadChunks(list, { quiet = false, patient = false } = {}) {
   if (!gameSocket) throw new Error(NO_SOCKET);
-  if (!list.length) return;
-  const msgList = chunkListMsg(list);
-  await sendScript(bField(13, msgList));
-  await sendScript(bField(12, [...msgList, ...vField(2, CHUNK)]));
-  list.forEach(([cx, cy]) => { scriptChunks.add(chunkKey(cx, cy)); chunkTouched.set(chunkKey(cx, cy), ++touchTick); });
-  await sleep(config.board.loadWait);         // give the snapshots time to arrive
-  await queue;
-  if (!quiet) console.log(`[board] loaded ${list.length} chunks`);
+  if (!list.length) return { arrived: 0, presumedEmpty: 0, incomplete: 0 };
+  const keys = list.map(([cx, cy]) => chunkKey(cx, cy));
+  keys.forEach((k) => { pendingSnapshots.add(k); presumedEmpty.delete(k); });
+  try {
+    const msgList = chunkListMsg(list);
+    await sendScript(bField(13, msgList));
+    await sendScript(bField(12, [...msgList, ...vField(2, CHUNK)]));
+  } catch (e) {
+    keys.forEach((k) => pendingSnapshots.delete(k));
+    throw e;
+  }
+  keys.forEach((k) => { scriptChunks.add(k); chunkTouched.set(k, ++touchTick); });
+  const result = await waitForSnapshots(keys, { patient });
+  if (result.incomplete)
+    console.warn(`[board] ${result.incomplete} of ${list.length} chunks sent nothing within ${config.board.loadMaxWait} ms; ` +
+      'treating them as unknown (not empty) until they load');
+  if (!quiet) console.log(`[board] loaded ${list.length} chunks (${result.arrived} with data)`);
+  return result;
+}
+
+// The server sends no snapshot for a chunk nobody has touched, and a chunk that
+// has one may be slow, so "nothing yet" is ambiguous. The wait ends when:
+//   - every chunk has its snapshot; or
+//   - at least board.loadWait ms passed AND no snapshot arrived for board.loadQuiet ms:
+//     the chunks still silent are presumed untouched (remembered in presumedEmpty so a
+//     final re-check can double-check them); or
+//   - board.loadMaxWait ms passed: the silent chunks are marked incomplete, which means
+//     UNKNOWN. The solver never treats an incomplete chunk as empty or "stuck".
+async function waitForSnapshots(keys, { patient = false } = {}) {
+  const { loadWait, loadQuiet, loadMaxWait } = config.board;
+  const minWait = patient ? loadWait * 2 : loadWait, quiet = patient ? loadQuiet * 3 : loadQuiet;
+  const t0 = Date.now();
+  const silent = () => keys.filter((k) => pendingSnapshots.has(k));
+  for (;;) {
+    await sleep(25);
+    await queue;                                          // process frames that already arrived
+    const now = Date.now(), left = silent();
+    let outcome = null;
+    if (!left.length) outcome = 'all';
+    else if (now - t0 >= loadMaxWait) outcome = 'incomplete';
+    else if (now - t0 >= minWait && now - Math.max(lastSnapshotAt, t0) >= quiet) outcome = 'quiet';
+    if (!outcome) continue;
+    for (const k of left) {
+      pendingSnapshots.delete(k);
+      if (outcome === 'incomplete') { incompleteChunks.add(k); stats.chunksIncomplete++; }
+      else { presumedEmpty.add(k); stats.chunksPresumedEmpty++; }
+    }
+    return { arrived: keys.length - left.length,
+             presumedEmpty: outcome === 'quiet' ? left.length : 0,
+             incomplete: outcome === 'incomplete' ? left.length : 0 };
+  }
 }
 
 // Snapshot the chunks around you (radius in chunks: 1 = the 3x3 block)
@@ -583,7 +647,10 @@ const withPadding = ([x0, y0, x1, y1], pad = config.board.solverPadding) =>
 async function unsubscribeChunks(keys) {
   if (!keys.length || !gameSocket) return;
   await sendScript(bField(13, chunkListMsg(keys.map((k) => k.split(',').map(Number)))));
-  for (const k of keys) { scriptChunks.delete(k); chunkTouched.delete(k); }
+  for (const k of keys) {
+    scriptChunks.delete(k); chunkTouched.delete(k);
+    pendingSnapshots.delete(k); presumedEmpty.delete(k); incompleteChunks.delete(k);
+  }
 }
 
 // Stop watching every chunk the script loaded except those in `keep` (never one
@@ -609,6 +676,19 @@ function viewChunks() {
   const keep = new Set();
   if (view) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) keep.add(chunkKey(view.cx + dx, view.cy + dy));
   return keep;
+}
+
+// A rectangle is "settled" when none of the chunks it needs is incomplete, i.e. what
+// the board shows there can be trusted. Unsettled areas are never marked stuck/empty.
+const isSettled = (rect) => !chunksIn(...withPadding(rect)).some(([cx, cy]) => incompleteChunks.has(chunkKey(cx, cy)));
+
+// True when nothing in the rectangle has ever been revealed or flagged
+const isUntouched = (rect) => countHidden(rect) === (rect[2] - rect[0] + 1) * (rect[3] - rect[1] + 1);
+
+// Ask again, patiently, for the chunks a rectangle needs that never sent data
+async function reloadUnsettled(rect) {
+  const list = chunksIn(...withPadding(rect)).filter(([cx, cy]) => incompleteChunks.has(chunkKey(cx, cy)));
+  if (list.length) await loadChunks(list, { quiet: true, patient: true });
 }
 
 // What the bot is holding right now (returned as well as printed)
@@ -1008,7 +1088,12 @@ const planSize = (p) => p.flags.length + p.chords.length + p.reveals.length;
 // ===========================================================================
 
 let solving = false, stopRequested = false;
-const stopSolve = () => { stopRequested = true; };
+const stopSolve = () => {
+  if (!solving) { console.log('[solve] nothing is running'); return; }
+  stopRequested = true;
+  stopWhy = 'stopSolve() was called';
+  console.log('[solve] stop requested; finishing the action in flight, then ending the run');
+};
 
 // Cell rectangle of a size x size square centred on [x, y]
 function areaAround([x, y], size) {
@@ -1029,11 +1114,11 @@ async function runPass(rect, { delay = config.solver.actionDelay, passWait = con
   await ensureLoaded(...withPadding(rect));
   const plan = planSolve(...rect);
   const done = { flags: [], chords: [], reveals: [], skipped: 0 };
-  const check = { flagged: 0, revealed: 0, hitMine: [], notUpdated: [] };
+  const noCheck = { flagged: 0, revealed: 0, hitMine: [], notUpdated: [] };
   if (!quiet) console.log(`[solve] area ${rectText(rect)}: ${plan.flags.length} flags, ` +
     `${plan.chords.length} chords, ${plan.reveals.length} reveals` +
     (plan.contradictions ? `, ${plan.contradictions} contradictions skipped` : ''));
-  if (!planSize(plan)) return { plan, done, check };
+  if (!planSize(plan)) return { plan, done, check: noCheck, tally: () => noCheck };
 
   const chordCells = [];                 // cells each executed chord should open
   const steps = [                        // flags first, then chords, then single reveals
@@ -1069,16 +1154,22 @@ async function runPass(rect, { delay = config.solver.actionDelay, passWait = con
   const waitStart = Date.now();
   do { await sleep(50); await queue; } while (pendingCount() > 0 && Date.now() - waitStart < passWait);
 
-  for (const k of done.flags) {
-    const st = getCell(...parseKey(k)).state;
-    if (st === 'flag') check.flagged++; else check.notUpdated.push(`flag ${k} -> ${st}`);
-  }
-  for (const k of openCells) {
-    const st = getCell(...parseKey(k)).state;
-    if (st === 'number') check.revealed++;
-    else if (st === 'mine') check.hitMine.push(k);
-    else check.notUpdated.push(`reveal ${k} -> ${st}`);
-  }
+  // What the board shows of this pass's actions right now (can be called again later)
+  const tally = () => {
+    const c = { flagged: 0, revealed: 0, hitMine: [], notUpdated: [] };
+    for (const k of done.flags) {
+      const st = getCell(...parseKey(k)).state;
+      if (st === 'flag') c.flagged++; else c.notUpdated.push(`flag ${k} -> ${st}`);
+    }
+    for (const k of openCells) {
+      const st = getCell(...parseKey(k)).state;
+      if (st === 'number') c.revealed++;
+      else if (st === 'mine') c.hitMine.push(k);
+      else c.notUpdated.push(`reveal ${k} -> ${st}`);
+    }
+    return c;
+  };
+  const check = tally();
   if (check.hitMine.length) console.warn('[solve] revealed a mine (should never happen):', check.hitMine);
   if (!quiet) {
     console.log(`[solve] sent ${done.flags.length} flags, ${done.chords.length} chords, ${done.reveals.length} reveals ` +
@@ -1086,13 +1177,13 @@ async function runPass(rect, { delay = config.solver.actionDelay, passWait = con
     if (check.notUpdated.length)
       console.warn(`[solve] ${check.notUpdated.length} actions not reflected on the board yet, e.g.`, check.notUpdated.slice(0, 5));
   }
-  return { plan, done, check };
+  return { plan, done, check, tally };
 }
 
 // Run fn with the "solving" lock held
 async function exclusive(fn) {
   if (solving) { console.warn('[solve] already running (stopSolve() to cancel)'); return null; }
-  solving = true; stopRequested = false;
+  solving = true; stopRequested = false; stopWhy = '';
   try { return await fn(); } finally {
     solving = false;
     if (config.memory.releaseOnFinish)
@@ -1119,103 +1210,220 @@ async function solveRadius(size = config.solver.passSize,
   return exclusive(() => runPass(rect, { delay, passWait }));
 }
 
-// Repeat passes over the same area until it is solved or no safe move is left
+// How an area (or a whole run) can end, in words. Every code is logged with its reason.
+const STATUS = {
+  solved: 'solved',
+  stuck: 'stuck (needs a guess)',
+  stopped: 'stopped',
+  hitMine: 'hit a mine (stopped to be safe)',
+  stalled: 'stalled (actions not taking effect)',
+  maxPasses: 'max passes reached',
+  unloaded: 'chunks did not load',
+  disconnected: 'game connection closed',
+};
+const WHY = (code) => ({
+  stopped: stopWhy || 'stopSolve() was called',
+  hitMine: 'a reveal opened a mine, which a safe-move solver should never do, so it stopped. ' +
+    'Look at the board around the last actions before running again',
+  stalled: `actions were sent but the board never showed any of them taking effect (${config.solver.maxStalledPasses} passes ` +
+    `in a row, each given ${config.solver.confirmTimeout} ms). Rate limit, lag or a dead connection? Try a larger solver.actionDelay`,
+  disconnected: 'the game connection is closed. Wait for the game to reconnect (or reload the page), then run it again',
+  unloaded: `the server sent nothing for this area's chunks within board.loadMaxWait (${config.board.loadMaxWait} ms), even after retrying`,
+  maxPasses: `solver.maxPasses (${config.solver.maxPasses}) passes were used on this area; it may still have safe moves`,
+}[code]);
+
+// Only a socket that is closing or closed counts as disconnected (2 = CLOSING, 3 = CLOSED)
+const socketOpen = () => { try { return !!gameSocket && gameSocket.readyState !== 2 && gameSocket.readyState !== 3; } catch { return true; } };
+
+// After a pass that confirmed nothing, keep looking for ANY sign of life for up to
+// solver.confirmTimeout before calling it a stall (a lag spike is not a failure)
+async function awaitConfirmation(pass) {
+  const until = Date.now() + config.solver.confirmTimeout;
+  let check = pass.tally();
+  while (check.flagged + check.revealed === 0 && !check.hitMine.length && Date.now() < until && !stopRequested) {
+    await sleep(50);
+    await queue;
+    check = pass.tally();
+  }
+  return check;
+}
+
+// Repeat passes over the same area until it is solved or no safe move is left.
+// Returns { code, status, passes, flags, chords, reveals, hiddenLeft }; `code` is a key of STATUS.
 async function areaLoop(rect, { delay, passWait, maxPasses = config.solver.maxPasses, quiet = false } = {}) {
   const total = { passes: 0, flags: 0, chords: 0, reveals: 0 };
-  let status = 'max passes reached';
+  let code = 'maxPasses', stalled = 0, reloads = 0;
   while (total.passes < maxPasses) {
-    if (stopRequested) { status = 'stopped'; break; }
-    const { plan, done, check } = await runPass(rect, { delay, passWait, quiet: true });
-    if (!planSize(plan)) { status = countHidden(rect) === 0 ? 'solved' : 'stuck (needs a guess)'; break; }
+    if (stopRequested) { code = 'stopped'; break; }
+    if (!socketOpen()) { code = 'disconnected'; break; }
+    const pass = await runPass(rect, { delay, passWait, quiet: true });
+    const { plan, done } = pass;
+    let { check } = pass;
+    if (!planSize(plan)) {
+      if (!isSettled(rect)) {              // no moves, but only because some chunks never sent data
+        if (reloads++ < 2) { await reloadUnsettled(rect); continue; }
+        code = 'unloaded'; break;
+      }
+      code = countHidden(rect) === 0 ? 'solved' : 'stuck';
+      break;
+    }
     total.passes++;
     total.flags += done.flags.length; total.chords += done.chords.length; total.reveals += done.reveals.length;
     const sent = done.flags.length + done.chords.length + done.reveals.length;
     if (!quiet) console.log(`[area] pass ${total.passes}: ${done.flags.length} flags, ` +
       `${done.chords.length} chords, ${done.reveals.length} reveals`);
-    if (check.hitMine.length) { status = 'hit a mine (stopped to be safe)'; break; }
-    if (sent > 0 && check.flagged + check.revealed === 0) { status = 'no progress (actions not taking effect)'; break; }
+    if (sent > 0 && !check.hitMine.length && check.flagged + check.revealed === 0) {
+      check = await awaitConfirmation(pass);
+      if (check.flagged + check.revealed === 0 && !check.hitMine.length) {
+        if (++stalled >= config.solver.maxStalledPasses) { code = 'stalled'; break; }
+        console.warn(`[area] pass ${total.passes}: nothing confirmed after ${config.solver.confirmTimeout} ms ` +
+          `(stalled pass ${stalled} of ${config.solver.maxStalledPasses}); planning again`);
+        continue;
+      }
+    }
+    stalled = 0;
+    if (check.hitMine.length) { code = 'hitMine'; break; }
   }
   const hiddenLeft = countHidden(rect);
-  if (!quiet) console.log(`[area] ${rectText(rect)} ${status}: ${total.passes} passes, ${total.flags} flags, ` +
-    `${total.chords} chords, ${total.reveals} reveals, ${hiddenLeft} hidden cells left`);
-  return { status, ...total, hiddenLeft };
+  const status = STATUS[code];
+  if (!quiet) {
+    console.log(`[area] ${rectText(rect)} ${status}: ${total.passes} passes, ${total.flags} flags, ` +
+      `${total.chords} chords, ${total.reveals} reveals, ${hiddenLeft} hidden cells left`);
+    if (WHY(code)) console.warn(`[area] why: ${WHY(code)}`);
+  }
+  return { code, status, ...total, hiddenLeft };
 }
 
 async function solveArea(size = config.solver.areaSize,
                          { delay, passWait, maxPasses, center } = {}) {
   const rect = areaAround(startPoint(center), size);
-  return exclusive(() => areaLoop(rect, { delay, passWait, maxPasses }));
+  return exclusive(async () => {
+    const r = await areaLoop(rect, { delay, passWait, maxPasses });
+    lastRun = { command: 'solveArea', endReason: r.code, detail: WHY(r.code) ?? r.status, endedAt: new Date(), ...r };
+    return r;
+  });
 }
 
 // ===========================================================================
 // 16. SOLVER: AUTOSOLVE (area after area)
 // ===========================================================================
 
+// The pickers return either an area to work on ({ center, work, ... }) or, when the
+// search is over, { end: <reason code>, detail: <sentence> } so autoSolve can say why.
+
+// Before giving up on a stretch of board that looks blank, ask again (patiently) for
+// the chunks in it that were slow to answer: "no data yet" must not read as "empty".
+async function recheckSlowChunks(cands) {
+  const list = new Map();
+  for (const c of cands) for (const [cx, cy] of chunksIn(...withPadding(c.rect))) {
+    const k = chunkKey(cx, cy);
+    if (presumedEmpty.has(k) || incompleteChunks.has(k)) list.set(k, [cx, cy]);
+  }
+  if (!list.size) return { found: null, rechecked: 0 };
+  console.log(`[auto] about to give up; re-checking ${list.size} chunks that were slow to answer`);
+  await loadChunks([...list.values()], { quiet: true, patient: true });
+  for (const c of cands) {
+    if (stopRequested) break;
+    const work = planSize(planSolve(...c.rect));
+    if (work > 0) return { found: c.result(work), rechecked: list.size };
+  }
+  return { found: null, rechecked: list.size };
+}
+
+// The search met `dead` blank (or unverifiable) rings/bands in a row
+async function blankEnd(unit, dead, cells, recent) {
+  const re = await recheckSlowChunks(recent);
+  if (re.found) return re.found;
+  const shaky = recent.some((c) => !isSettled(c.rect));
+  const base = `${dead} ${unit}s of areas in a row (about ${cells} cells out) had `;
+  if (shaky) return { end: 'chunksNotLoading', detail: base + 'no chunk data that could be trusted: the server ' +
+    'sent nothing for some chunks even after re-checking. Check the connection and boardStatus()' };
+  return { end: 'blankGap', detail: base + `nothing revealed in them, so the search stopped (auto.giveUpAfterEmpty = ` +
+    `${config.auto.giveUpAfterEmpty}); raise it to search across wider gaps` +
+    (re.rechecked ? ` [re-checked ${re.rechecked} slow chunks first]` : '') };
+}
+
 // 'mostWork': the nearby area with the most guaranteed moves. Candidate areas sit
 // on a grid around the current one (step = size - overlap, so neighbours overlap a
-// little), searched ring by ring outward. Returns null if nothing nearby has work.
+// little), searched ring by ring outward.
 async function pickNextArea(center, size, step, maxRings) {
-  let emptyRings = 0;
+  let deadRings = 0, recent = [];
   for (let ring = 1; ring <= maxRings; ring++) {
     const reach = ring * step + Math.ceil(size / 2) + config.board.solverPadding;
     await ensureLoaded(center[0] - reach, center[1] - reach, center[0] + reach, center[1] + reach);
-    let best = null, allEmpty = true;
+    let best = null, live = false;
+    const areas = [];
     for (let j = -ring; j <= ring; j++) for (let i = -ring; i <= ring; i++) {
       if (Math.max(Math.abs(i), Math.abs(j)) !== ring) continue;
       const c = [center[0] + i * step, center[1] + j * step];
       const rect = areaAround(c, size);
       const work = planSize(planSolve(...rect));
       if (work > 0 && (!best || work > best.work)) best = { center: c, work };
-      if (allEmpty && !isUntouched(rect)) allEmpty = false;
+      if (isSettled(rect) && !isUntouched(rect)) live = true;    // real, trustworthy board data
+      areas.push({ rect, result: (w) => ({ center: c, work: w }) });
     }
     if (best) return best;
-    if (stopRequested) return null;
-    // Nothing but untouched board for several rings in a row: there is nothing out there
-    emptyRings = allEmpty ? emptyRings + 1 : 0;
-    if (emptyRings >= config.auto.giveUpAfterEmpty) return null;
+    if (stopRequested) return { end: 'stopped', detail: WHY('stopped') };
+    if (live) { deadRings = 0; recent = []; } else { deadRings++; recent.push(...areas); }
+    if (deadRings >= config.auto.giveUpAfterEmpty) return blankEnd('ring', deadRings, ring * step, recent);
   }
-  return null;
+  return { end: 'ringLimit', detail: `searched ${maxRings} rings around the last area and none has a safe move (auto.maxRings)` };
 }
-
-// True when nothing in the rectangle has ever been revealed or flagged
-const isUntouched = (rect) => countHidden(rect) === (rect[2] - rect[0] + 1) * (rect[3] - rect[1] + 1);
 
 // 'nearest': the closest area to the starting point (on a grid of areas anchored
 // there) that still has a guaranteed move. Solved areas are skipped for good;
-// stuck ones are skipped until the solver works next to them again.
-// Candidates are generated one band at a time (areas whose distance from the
-// start, in grid steps, rounds to the same number) instead of all up front, so
-// maxRadius = Infinity is fine: the search ends when it finds work, when it
-// has seen giveUpAfterEmpty untouched bands in a row, or when stopSolve() is called.
+// stuck ones are skipped until the solver works next to them again. Only areas
+// whose content was really seen are remembered: an all-hidden area, or one whose
+// chunks never finished loading, could just be data that hasn't arrived.
+// Candidates are examined one distance band at a time (areas whose distance from
+// the start, in grid steps, rounds to the same number), never listed up front, so
+// maxRadius = Infinity is fine.
 async function pickNearestToStart(start, size, step, areaState, maxRadius) {
   const centerOf = ([i, j]) => [start[0] + i * step, start[1] + j * step];
-  let emptyBands = 0;
+  let deadBands = 0, recent = [];
   for (let band = 0; band <= maxRadius; band++) {
     // Offsets with round(distance) === band lie within +-band on both axes
     const batch = [];
+    let known = 0;
     for (let j = -band; j <= band; j++) for (let i = -band; i <= band; i++) {
       const dist = Math.hypot(i, j);
-      if (Math.round(dist) === band && dist <= maxRadius && !areaState.has(`${i},${j}`)) batch.push([i, j]);
+      if (Math.round(dist) !== band || dist > maxRadius) continue;
+      if (areaState.has(`${i},${j}`)) known++; else batch.push([i, j]);
     }
-    if (!batch.length) continue;
+    if (!batch.length) { deadBands = 0; recent = []; continue; }     // a band of known areas is real board
     batch.sort((p, q) => p[0] ** 2 + p[1] ** 2 - (q[0] ** 2 + q[1] ** 2));
     await ensureRects(batch.map((q) => withPadding(areaAround(centerOf(q), size))));
-    let allEmpty = true;
+    let live = known > 0;
+    const areas = [];
     for (const q of batch) {                       // sorted by distance
       const rect = areaAround(centerOf(q), size);
       const work = planSize(planSolve(...rect));
       if (work > 0) return { center: centerOf(q), grid: q, work };
-      if (!isUntouched(rect)) allEmpty = false;
-      areaState.set(`${q[0]},${q[1]}`, countHidden(rect) === 0 ? 'solved' : 'stuck');
+      if (isSettled(rect) && !isUntouched(rect)) {
+        live = true;
+        areaState.set(`${q[0]},${q[1]}`, countHidden(rect) === 0 ? 'solved' : 'stuck');
+      }
+      areas.push({ rect, result: (w) => ({ center: centerOf(q), grid: q, work: w }) });
     }
-    if (stopRequested) return null;
-    emptyBands = allEmpty ? emptyBands + 1 : 0;
-    if (emptyBands >= config.auto.giveUpAfterEmpty) return null;
+    if (stopRequested) return { end: 'stopped', detail: WHY('stopped') };
+    if (live) { deadBands = 0; recent = []; } else { deadBands++; recent.push(...areas); }
+    if (deadBands >= config.auto.giveUpAfterEmpty) return blankEnd('band', deadBands, Math.round(band * step), recent);
   }
-  return null;
+  return { end: 'radiusLimit', detail: `every area within ${maxRadius} steps (about ${Math.round(maxRadius * step)} cells) ` +
+    'of the start has been checked and none has a safe move (auto.maxRadius)' };
 }
 
-// Solve an area completely, pick the next area, and repeat.
+// Solve an area completely, pick the next area, and repeat. Whenever a run ends, the
+// console says so on an "[auto] ENDED (<reason>)" line and msbot.lastRun keeps the summary:
+//   stopped         stopSolve() was called (or the bot was unhooked)
+//   maxAreas        the requested number of areas was done
+//   hitMine         a reveal opened a mine (should never happen)
+//   stalled         actions were sent but the board never reflected them
+//   disconnected    the game WebSocket closed
+//   chunksNotLoading  the server sent no data for chunks it should have
+//   blankGap        the search met auto.giveUpAfterEmpty blank rings/bands in a row
+//   radiusLimit / ringLimit   everything within auto.maxRadius / auto.maxRings was checked
+//   error           an exception was thrown
 async function autoSolve(size = config.solver.areaSize, {
   delay, passWait, maxPasses,
   overlap = Math.round(size * config.auto.overlapRatio),
@@ -1232,43 +1440,58 @@ async function autoSolve(size = config.solver.areaSize, {
   return exclusive(async () => {
     const total = { areas: 0, flags: 0, chords: 0, reveals: 0 };
     const started = Date.now();
-    while (total.areas < maxAreas && !stopRequested) {
-      const rect = areaAround(here, size);
-      const r = await areaLoop(rect, { delay, passWait, maxPasses, quiet: true });
-      total.areas++;
-      total.flags += r.flags; total.chords += r.chords; total.reveals += r.reveals;
-      console.log(`[auto] area ${total.areas} ${rectText(rect)}: ${r.status}; ` +
-        `${r.flags} flags, ${r.chords} chords, ${r.reveals} reveals (totals: ${total.flags} flags, ` +
-        `${total.chords} chords, ${total.reveals} reveals)`);
-      if (r.status.startsWith('hit a mine') || r.status.startsWith('no progress') || stopRequested) break;
+    let end = { reason: 'error', detail: 'an exception was thrown (see the error above)' };
+    let unloadedRow = 0;
+    try {
+      for (;;) {
+        const rect = areaAround(here, size);
+        const r = await areaLoop(rect, { delay, passWait, maxPasses, quiet: true });
+        total.areas++;
+        total.flags += r.flags; total.chords += r.chords; total.reveals += r.reveals;
+        console.log(`[auto] area ${total.areas} ${rectText(rect)}: ${r.status}; ` +
+          `${r.flags} flags, ${r.chords} chords, ${r.reveals} reveals (totals: ${total.flags} flags, ` +
+          `${total.chords} chords, ${total.reveals} reveals)`);
+        if (['hitMine', 'stalled', 'disconnected', 'stopped'].includes(r.code)) { end = { reason: r.code, detail: WHY(r.code) }; break; }
+        if (r.code === 'maxPasses') console.warn(`[auto] ${WHY('maxPasses')}`);
+        unloadedRow = r.code === 'unloaded' ? unloadedRow + 1 : 0;
+        if (unloadedRow >= config.auto.maxUnloadedAreas) {
+          end = { reason: 'chunksNotLoading', detail: `${unloadedRow} areas in a row got no chunk data from the server: ${WHY('unloaded')}. ` +
+            'Check the connection and boardStatus()' };
+          break;
+        }
+        if (total.areas >= maxAreas) { end = { reason: 'maxAreas', detail: `reached the requested limit of ${maxAreas} areas` }; break; }
 
-      let next;
-      if (mode === 'nearest') {
-        areaState.set(`${grid[0]},${grid[1]}`, r.status === 'solved' ? 'solved' : 'stuck');
-        // Work done here may unblock the overlapping neighbours: check them again
-        if (r.flags + r.chords + r.reveals > 0)
-          for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
-            const k = `${grid[0] + di},${grid[1] + dj}`;
-            if ((di || dj) && areaState.get(k) === 'stuck') areaState.delete(k);
-          }
-        next = await pickNearestToStart(start, size, step, areaState, maxRadius);
-      } else {
-        next = await pickNextArea(here, size, step, maxRings);
+        let next;
+        if (mode === 'nearest') {
+          if (r.code !== 'unloaded') areaState.set(`${grid[0]},${grid[1]}`, r.code === 'solved' ? 'solved' : 'stuck');
+          // Work done here may unblock the overlapping neighbours: check them again
+          if (r.flags + r.chords + r.reveals > 0)
+            for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+              const k = `${grid[0] + di},${grid[1] + dj}`;
+              if ((di || dj) && areaState.get(k) === 'stuck') areaState.delete(k);
+            }
+          next = await pickNearestToStart(start, size, step, areaState, maxRadius);
+        } else {
+          next = await pickNextArea(here, size, step, maxRings);
+        }
+        if (next.end) { end = { reason: next.end, detail: next.detail }; break; }
+        // Keep chunks around the next area and around your own view; drop the rest
+        const reach = size + 2 * (step + config.auto.keepMargin);
+        const keep = new Set(chunksIn(...areaAround(next.center, reach)).map(([a, b]) => chunkKey(a, b)));
+        for (const k of viewChunks()) keep.add(k);
+        await releaseChunks(keep);
+        console.log(`[auto] moving to ${next.center} (${next.work} safe moves waiting)`);
+        here = next.center;
+        if (next.grid) grid = next.grid;
       }
-      if (!next) { console.log('[auto] no area with a safe move found within range; stopping'); break; }
-      // Keep chunks around the next area and around your own view; drop the rest
-      const reach = size + 2 * (step + config.auto.keepMargin);
-      const keep = new Set(chunksIn(...areaAround(next.center, reach)).map(([a, b]) => chunkKey(a, b)));
-      for (const k of viewChunks()) keep.add(k);
-      await releaseChunks(keep);
-      console.log(`[auto] moving to ${next.center} (${next.work} safe moves waiting)`);
-      here = next.center;
-      if (next.grid) grid = next.grid;
+    } finally {
+      const minutes = +((Date.now() - started) / 60000).toFixed(1);
+      console.log(`[auto] ENDED (${end.reason}) after ${minutes} min: ${end.detail}`);
+      console.log(`[auto] totals: ${total.areas} areas, ${total.flags} flags, ${total.chords} chords, ${total.reveals} reveals`);
+      lastRun = { command: 'autoSolve', endReason: end.reason, detail: end.detail, ...total,
+                  lastCenter: here, minutes, endedAt: new Date() };
     }
-    const mins = ((Date.now() - started) / 60000).toFixed(1);
-    console.log(`[auto] finished after ${mins} min: ${total.areas} areas, ${total.flags} flags, ` +
-      `${total.chords} chords, ${total.reveals} reveals`);
-    return { ...total, lastCenter: here };
+    return { ...total, lastCenter: here, endReason: end.reason, endDetail: end.detail };
   });
 }
 
@@ -1284,6 +1507,8 @@ function boardStatus() {
     ...stats,
     lastError: stats.lastError ? String(stats.lastError) : '',
     chunksLoaded: loaded.length,
+    chunksSilentNow: `${presumedEmpty.size} presumed empty, ${incompleteChunks.size} unknown`,
+    lastRun: lastRun ? `${lastRun.command}: ${lastRun.endReason} (${lastRun.detail})` : 'none yet',
     chunksWithRevealedCells: loaded.filter((c) => c.some((v) => v !== 0)).length,
     view: view ? `${whereAmI()} (chunk ${view.cx},${view.cy})` : 'unknown',
     clickMode: config.click.enabled
@@ -1313,6 +1538,8 @@ const api = {
   planSolve, solveRadius, solveArea, autoSolve, stopSolve, areaAround, countHidden,
   // logs / internals
   actionLog, showActionLog, stats, dispose,
+  waitForSnapshots, recheckSlowChunks, pendingSnapshots, presumedEmpty, incompleteChunks,
+  get lastRun() { return lastRun; },
   get view() { return view; },
   get socket() { return gameSocket; },
 };

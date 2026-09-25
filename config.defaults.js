@@ -25,6 +25,8 @@ const DEFAULT_CONFIG = {
     areaSize: 100,
     actionDelay: 10,
     passWait: 20,
+    confirmTimeout: 3000,
+    maxStalledPasses: 3,
     maxPasses: 1000,
   },
   auto: {
@@ -33,12 +35,15 @@ const DEFAULT_CONFIG = {
     maxRings: Infinity,
     maxRadius: Infinity,
     giveUpAfterEmpty: 3,
+    maxUnloadedAreas: 3,
     maxAreas: Infinity,
     keepMargin: 4,
   },
   board: {
     loadRadius: 1,
     loadWait: 500,
+    loadQuiet: 300,
+    loadMaxWait: 5000,
     solverPadding: 2,
   },
   memory: {
