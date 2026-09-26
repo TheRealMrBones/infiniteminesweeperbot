@@ -16,8 +16,9 @@ globalThis.window = globalThis;
 globalThis.window.addEventListener = () => {};
 globalThis.document = { elementFromPoint: () => null };
 
-// The bot keeps whatever send() it finds as the "real" one, so give it a harmless stub
-WebSocket.prototype.send = function () {};
+// The bot keeps whatever send() it finds as the "real" one, so give it a stub that
+// lets a fake socket play server (see makeSocket below)
+WebSocket.prototype.send = function (data) { this.onSend?.(data); };
 
 const BOT = path.join(__dirname, '..', 'infiniteMinesweeperBot.js');
 eval(fs.readFileSync(BOT, 'utf8'));          // eslint-disable-line no-eval -- it is a console script
@@ -107,9 +108,68 @@ if (problems.length) console.log(problems.slice(0, 5));
 
 // --- action encoding through the socket hook -------------------------------
 (async () => {
-  const fake = Object.create(WebSocket.prototype);      // enough for the hook to latch onto
-  Object.defineProperty(fake, 'url', { value: 'wss://infiniteminesweeper.com/ws' });
-  try { fake.send(new Uint8Array([1])); } catch { /* the real send rejects our stub; the hook already ran */ }
+  // A tiny protobuf writer/reader, to play the server's side
+  const zlib = require('node:zlib');
+  const varint = (n) => { const o = []; do { let b = n % 128; n = Math.floor(n / 128); if (n) b |= 128; o.push(b); } while (n); return o; };
+  const vF = (f, v) => [...varint(f * 8), ...varint(v)];
+  const bF = (f, b) => [...varint(f * 8 + 2), ...varint(b.length), ...b];
+  const zz = (n) => (n >= 0 ? 2 * n : -2 * n - 1);
+  const tile = (cx, cy) => bF(1, [...vF(1, zz(cx)), ...vF(2, zz(cy))]);
+  function* pbFields(b) {
+    let i = 0;
+    const read = () => { let r = 0, m = 1, x; do { x = b[i++]; r += (x & 127) * m; m *= 128; } while (x & 128); return r; };
+    while (i < b.length) {
+      const key = read(), wire = key & 7, num = Math.floor(key / 8);
+      if (wire === 0) yield [num, read()];
+      else { const len = read(); yield [num, b.subarray(i, i + len)]; i += len; }
+    }
+  }
+
+  // Enough of a WebSocket for the bot: a real EventTarget (so frames can be delivered
+  // as MessageEvents) wearing WebSocket's prototype. With `answer` set it replies like
+  // the server: a revealAck for every action and a seedResponse for every seed request.
+  const makeSocket = ({ answer = false } = {}) => {
+    const ws = new EventTarget();
+    Object.setPrototypeOf(ws, WebSocket.prototype);
+    Object.defineProperties(ws, {
+      url: { value: 'wss://infiniteminesweeper.com/ws' },
+      readyState: { value: 1, writable: true },
+      bufferedAmount: { value: 0, writable: true },
+      answer: { value: answer, writable: true },
+      closedWith: { value: null, writable: true },
+      tiles: { value: null, writable: true },     // chunk key -> bytes to answer subscriptions with
+      close: { value: (code = 1006, reason = '') => {
+        if (ws.readyState === 3) return;
+        ws.readyState = 3; ws.closedWith = code;
+        ws.dispatchEvent(Object.assign(new Event('close'), { code, reason, wasClean: false }));
+      } },
+      receive: { value: (msg) => ws.dispatchEvent(new MessageEvent('message',
+        { data: new Uint8Array(zlib.gzipSync(Buffer.from(msg))).buffer })) },
+      onSend: { value: (data) => {
+        if (!ws.answer || ws.readyState !== 1) return;
+        for (const [type, body] of pbFields(zlib.gunzipSync(Buffer.from(data)))) {
+          if (type === 4) {
+            const id = [...pbFields(body)].find(([f]) => f === 1)?.[1];
+            setTimeout(() => ws.receive(bF(8, [...vF(1, id), ...vF(2, 1)])), 5);
+          }
+          if (type === 21) setTimeout(() => ws.receive(bF(22, [])), 5);
+          if (type === 12 && ws.tiles) {          // subscribe: send back the tiles it knows
+            const back = [];
+            for (const [f, t] of pbFields(body)) {
+              if (f !== 1) continue;
+              const xy = Object.fromEntries(pbFields(t)), un = (v = 0) => (v % 2 ? -(v + 1) / 2 : v / 2);
+              const data = ws.tiles.get(`${un(xy[1])},${un(xy[2])}`);
+              if (data) back.push(...bF(1, [...bF(1, t), ...bF(3, [...data])]));
+            }
+            if (back.length) setTimeout(() => ws.receive(bF(29, back)), 5);
+          }
+        }
+      } },
+    });
+    ws.send(new Uint8Array(zlib.gzipSync(Buffer.alloc(0))));   // the game's first message: the hook captures it
+    return ws;
+  };
+  const fake = makeSocket();
   ok('the hook captures the game socket', bot.socket === fake);
 
   bot.config.logging.actions = false;
@@ -124,7 +184,7 @@ if (problems.length) console.log(problems.slice(0, 5));
   // --- memory management ----------------------------------------------------
   const settle = () => new Promise((r) => setTimeout(r, 200));   // frames are processed asynchronously
   // The stub server never answers, so keep every wait short
-  const fastConfig = () => bot.setConfig({ board: { loadWait: 0, loadQuiet: 0 }, solver: { confirmTimeout: 30 } });
+  const fastConfig = () => bot.setConfig({ board: { loadWait: 0, loadQuiet: 0 }, solver: { confirmTimeout: 30 }, net: { autoRecover: false } });
   fastConfig();
   bot.chunks.clear();                                            // leftovers from the solver boards above
   await bot.loadChunks([[0, 0], [1, 0], [2, 0]], { quiet: true });
@@ -291,6 +351,129 @@ if (problems.length) console.log(problems.slice(0, 5));
   const [rStop, stopMs] = await timed(() => farWork(30, 'nearest', {}));
   ok('stopSolve() ends the run promptly and says it was stopped',
      rStop.endReason === 'stopped' && stopMs < 3000 && /stopSolve/.test(bot.lastRun.detail));
+
+  await bot.cleanup({ keepView: false });
+
+  // --- the connection dropping -------------------------------------------------
+  await settle();
+  fastConfig();
+  bot.setConfig({ net: { resyncPoll: 20, resyncSettle: 50, reconnectTimeout: 1000 } });
+  bot.chunks.set('0,0', new Uint8Array(CHUNK * CHUNK));
+  bot.socket.close(1006);
+  ok('a closed connection drops the board it was keeping', bot.chunks.size === 0 && bot.lastClose?.code === 1006);
+  const sentBefore = bot.stats.sent;
+  let err = null;
+  try { await bot.sendAction(bot.ACTION.FLAG, 0, 0, 1, 1); } catch (e) { err = e; }
+  ok('nothing is written to a closed socket', err?.name === 'Disconnected' && bot.stats.sent === sentBefore);
+  makeSocket();
+
+  // Drop the connection while a run waits for confirmation, then (maybe) reconnect
+  async function dropRun(opts, reconnectAfter) {
+    await settle();
+    fastConfig();
+    bot.setConfig({ solver: { confirmTimeout: 5000 }, net: { resyncPoll: 20, resyncSettle: 50, reconnectTimeout: 1000, autoRecover: true, ...opts } });
+    setTimeout(() => bot.socket.close(1006), 300);
+    if (reconnectAfter) setTimeout(() => makeSocket(), reconnectAfter);
+    return timed(() => farWork(30, 'nearest', {}));
+  }
+  let [dr, dms] = await dropRun({ autoRecover: false }, 0);
+  ok('without autoRecover a dropped connection ends the run promptly as disconnected',
+     dr.endReason === 'disconnected' && dms < 2000 && /code 1006/.test(dr.endDetail));
+  makeSocket();
+  [dr, dms] = await dropRun({}, 0);
+  ok('a game that never reconnects ends the run after net.reconnectTimeout',
+     dr.endReason === 'disconnected' && dms >= 1200 && /reconnectTimeout/.test(dr.endDetail));
+  makeSocket();
+  [dr] = await dropRun({}, 600);
+  ok('after the game reconnects the run carries on', dr.recoveries === 1 && dr.endReason !== 'disconnected');
+  bot.resetConfig();
+  fastConfig();
+
+  // --- a new socket is followed the moment the game creates it -----------------
+  bot.setConfig({ net: { socketUrlMatch: '127.0.0.1:9/ws' } });
+  const created = new WebSocket('ws://127.0.0.1:9/ws');          // nothing listens there; it never opens
+  ok('a socket is picked up when it is created, before it sends anything', bot.socket === created);
+  created.addEventListener('error', () => {});
+  bot.resetConfig();
+  fastConfig();
+
+  // --- tile versions and resolutions -------------------------------------------
+  let ws = makeSocket();
+  const cell = (x, y) => bot.getCell(x, y).state;
+  const full = (ver, byte) => bF(15, [...tile(5, 5), ...vF(2, ver), ...bF(3, [...new Uint8Array(4096).fill(byte)]), ...vF(4, 64)]);
+  const delta = (ver, byte, res = 64) => bF(16, [...tile(5, 5), ...vF(2, ver),
+    ...bF(3, [...vF(1, 0), ...vF(2, 0), ...vF(3, 1), ...vF(4, 1), ...bF(5, [byte])]), ...vF(4, res)]);
+  bot.chunks.set('5,5', new Uint8Array(4096));
+  ws.receive(full(5, 0)); await settle();
+  ok('a single full tile (message 15) is read', bot.stats.snapshots > 0 && cell(320, 320) === 'hidden');
+  ws.receive(delta(3, 2)); await settle();
+  ok('a delta older than the data already held is dropped', cell(320, 320) === 'hidden' && bot.stats.staleDeltas === 1);
+  ws.receive(delta(7, 2, 16)); await settle();
+  ok('a delta at another resolution (game zoomed out) is not written into the board',
+     cell(320, 320) === 'hidden' && bot.stats.otherResolution === 1);
+  ws.receive(delta(6, 2)); await settle();
+  ok('a newer delta is applied', cell(320, 320) === 'number');
+
+  // --- flow control on the server's answers --------------------------------------
+  bot.setConfig({ net: { maxInFlight: 2, ackTimeout: 250 } });
+  const lost0 = bot.stats.acksLost;
+  [, ms] = await timed(async () => { for (let i = 0; i < 3; i++) await bot.sendAction(bot.ACTION.FLAG, 0, 0, i, 0); });
+  ok('with maxInFlight actions unanswered, the next one waits (until they count as lost)',
+     ms >= 200 && bot.stats.acksLost > lost0);
+  ws.answer = true;
+  const ok0 = bot.stats.acksOk;
+  [, ms] = await timed(async () => { for (let i = 0; i < 6; i++) await bot.sendAction(bot.ACTION.FLAG, 0, 0, i, 1); });
+  await settle();
+  ok('answered actions are counted and do not hold sending up', bot.stats.acksOk - ok0 === 6 && ms < 1000);
+  bot.resetConfig();
+  fastConfig();
+
+  let health = await bot.checkConnection({ quiet: true });
+  ok('checkConnection() reports a server that answers as healthy', health.probeOk && health.healthy);
+  ws.answer = false;
+  bot.setConfig({ net: { probeTimeout: 100 } });
+  health = await bot.checkConnection({ quiet: true });
+  ok('checkConnection() spots an open socket whose server stopped answering',
+     !health.probeOk && /reconnect\(\)/.test(health.verdict));
+  bot.resetConfig();
+  fastConfig();
+
+  // --- stalls: a stale board versus a dead connection ----------------------------
+  // The fake server answers every action, but the board never changes (its feed went stale)
+  const warns = [];
+  const realWarn = console.warn;
+  console.warn = (...a) => { warns.push(a.join(' ')); };
+  const planted = new Uint8Array(CHUNK * CHUNK);
+  planted[10 * CHUNK + 30] = 2;                                 // the same board stallRun and farWork set up
+  ws.answer = true;
+  ws.tiles = new Map([['0,0', planted]]);                       // ...and a reload brings back the same stale board
+  [sr] = await stallRun(60, 0);
+  console.warn = realWarn;
+  ok('actions the server answered but the board never showed make the bot reload the board first',
+     sr.code === 'stalled' && warns.some((l) => /reloading this area's chunks/.test(l)));
+
+  async function stallAuto(net, onClose) {
+    await settle();
+    fastConfig();
+    bot.setConfig({ solver: { confirmTimeout: 60 }, net: { autoRecover: true, stallCooldown: 50, probeTimeout: 100,
+      resyncPoll: 20, resyncSettle: 50, reconnectTimeout: 1500, ...net } });
+    const before = bot.socket;
+    if (onClose) {
+      const poll = setInterval(() => { if (before.readyState === 3) { clearInterval(poll); onClose(); } }, 20);
+    }
+    const r = await withTimeout(farWork(30, 'nearest', {}), 20000);
+    return { r, before };
+  }
+  let { r: sa } = await stallAuto({ maxRecoveries: 1 });
+  ok('autoSolve recovers from a stall while the server still answers, and says why it finally gave up',
+     sa !== 'TIMEOUT' && sa.recoveries === 1 && sa.endReason === 'stalled' && /maxRecoveries/.test(sa.endDetail));
+  ws.answer = false;
+  let before;
+  ({ r: sa, before } = await stallAuto({ maxRecoveries: 1 }, () => { ws = makeSocket({ answer: true }); }));
+  ok('a stall with a silent server makes the game open a new connection, and the run carries on there',
+     sa !== 'TIMEOUT' && before.closedWith === 4000 && sa.recoveries === 1 && bot.socket === ws);
+  bot.resetConfig();
+  fastConfig();
 
   await bot.cleanup({ keepView: false });
 

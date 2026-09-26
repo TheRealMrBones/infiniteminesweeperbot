@@ -102,6 +102,16 @@ const CONFIG = {
     resyncTimeout: 10000,    // ms to wait for the game to reconnect in resyncUI()
     resyncPoll: 200,         // ms between reconnect checks
     resyncSettle: 1500,      // ms to let the game resubscribe after reconnecting
+    maxBufferedBytes: 65536, // pause sending while this many bytes still wait in the browser's send buffer
+    maxInFlight: 50,         // at most this many actions waiting for the server's answer; sending pauses beyond it (0 = no limit)
+    ackTimeout: 5000,        // ms after which an unanswered action is counted as lost
+    probeTimeout: 3000,      // ms to wait for the server to answer a connection probe
+    autoRecover: true,       // autoSolve(): recover from a dropped or stalled connection instead of ending the run
+    stallCooldown: 5000,     // ms to pause before retrying when the server answers but the board stopped updating
+    reconnectTimeout: 60000, // ms to wait for the game to reconnect before ending the run
+    maxRecoveries: 10,       // end the run after this many recoveries without finishing an area in between
+    reconnectSlowdown: 1.5,  // after each recovery, multiply the action delay by this...
+    maxActionDelay: 100,     // ...but never raise it above this (ms)
   },
 };
 
@@ -171,6 +181,16 @@ const DEFAULT_CONFIG = {
     resyncTimeout: 10000,
     resyncPoll: 200,
     resyncSettle: 1500,
+    maxBufferedBytes: 65536,
+    maxInFlight: 50,
+    ackTimeout: 5000,
+    probeTimeout: 3000,
+    autoRecover: true,
+    stallCooldown: 5000,
+    reconnectTimeout: 60000,
+    maxRecoveries: 10,
+    reconnectSlowdown: 1.5,
+    maxActionDelay: 100,
   },
 };
 /* DEFAULTS:END */
@@ -251,13 +271,20 @@ const pendingSnapshots = new Set(); // chunks asked for whose snapshot hasn't ar
 const presumedEmpty = new Set();    // chunks that sent no snapshot before the server went quiet (assumed untouched)
 const incompleteChunks = new Set(); // chunks still silent after board.loadMaxWait: unknown, NOT empty
 let lastSnapshotAt = 0;             // when the last chunk snapshot arrived
+const chunkVersion = new Map();     // chunk key -> version of the tile data last applied (older deltas are dropped)
 let stopWhy = '';                   // why the current solver run was asked to stop
 let lastRun = null;                 // summary of the last solver run and why it ended
 const scriptSent = new WeakSet();   // outgoing frames this script created
 const seenEvents = new WeakSet();   // MessageEvents already copied
 
 let gameSocket = null;
-let view = null;                    // last position the game reported (chunk + cell)
+let connId = 0;                     // bumped whenever the game connection is lost or replaced
+let lastClose = null;               // { code, reason, clean, at } of the last connection that closed
+let lastFrameAt = 0;                // when anything last arrived from the server
+const inFlight = new Map();         // requestId -> time sent, for the bot's actions the server hasn't answered yet
+let lastRequestId = 0;
+let probe = null;                   // { resolve } while probeConnection() waits for the server's answer
+let view = null;                   // last position the game reported (chunk + cell)
 let queue = Promise.resolve();      // frames are processed strictly in order
 let holdChain = Promise.resolve(), holdBusy = 0;    // held outgoing messages (click mode)
 let pendingClick = null, guardUntil = 0, epoch = 0; // click-mode state
@@ -268,7 +295,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Counters for boardStatus(): shows whether frames are actually being processed
 const stats = {
   sent: 0, received: 0, snapshots: 0, patches: 0, patchesForUnloadedChunks: 0,
-  detached: 0, errors: 0, lastError: null, score: null, lastPoints: null,
+  detached: 0, errors: 0, lastError: null, score: null, lastPoints: null, disconnects: 0, reconnects: 0,
+  acksOk: 0, acksRejected: 0, acksLost: 0, staleDeltas: 0, otherResolution: 0,
   chunksPresumedEmpty: 0, chunksIncomplete: 0, clicksExact: 0, clicksCorrected: 0, clickTimeouts: 0, clickFallbacks: 0, gameActionsBlocked: 0,
 };
 
@@ -278,6 +306,7 @@ g.__msbotOriginals ??= {
   send: WebSocket.prototype.send,
   messageData: Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'data').get,
 };
+g.__msbotOriginals.WebSocket ??= g.WebSocket;    // (pastes of older versions didn't keep this one)
 const ORIGINAL = g.__msbotOriginals;
 const _origSend = ORIGINAL.send;
 
@@ -294,6 +323,7 @@ function dispose(reason = 'disposed') {
   stopRequested = true;                     // let any running solver finish its action and stop
   stopWhy = `the bot was unhooked (${reason})`;
   WebSocket.prototype.send = ORIGINAL.send;
+  g.WebSocket = ORIGINAL.WebSocket;
   Object.defineProperty(MessageEvent.prototype, 'data',
     { configurable: true, enumerable: true, get: ORIGINAL.messageData });
   listeners.abort();
@@ -304,13 +334,36 @@ function dispose(reason = 'disposed') {
 // 5. SOCKET HOOK
 // ===========================================================================
 
+// Start following a game socket. New connections are picked up the moment the game
+// creates them (constructor hook below); the socket that already existed when the
+// file was pasted is picked up the first time the game sends on it.
+function adoptSocket(ws, how) {
+  if (ws === gameSocket) return;
+  const replacing = !!gameSocket;
+  if (replacing) resetConnection();          // a new connection: nothing from the old one carries over
+  gameSocket = ws;
+  // Registered before the game sets onmessage, so this reads (and copies) each frame first;
+  // for a socket adopted late, touching ev.data triggers the capture hook below instead
+  ws.addEventListener('message', (ev) => ev.data, listenerOpts);
+  ws.addEventListener('close', (ev) => onSocketClosed(ws, ev), listenerOpts);
+  console.log(replacing ? `[net] picked up the game's new connection (${how})`
+                        : '[board] socket captured; run loadAround() to fetch your area');
+}
+
+// The game opens a fresh WebSocket whenever it reconnects. Waiting for it to send
+// something first would miss the switch for a while (in a background tab its first
+// message waits for an animation frame that never comes), so catch it at creation.
+g.WebSocket = new Proxy(ORIGINAL.WebSocket, {
+  construct(target, args, newTarget) {
+    const ws = Reflect.construct(target, args, newTarget === g.WebSocket ? target : newTarget);
+    try { if (!disposed && String(args[0]).includes(config.net.socketUrlMatch)) adoptSocket(ws, 'created'); }
+    catch (e) { console.warn('[net] could not follow the new socket:', e); }
+    return ws;
+  },
+});
+
 WebSocket.prototype.send = function (data) {
-  if (this.url.includes(config.net.socketUrlMatch) && gameSocket !== this) {
-    gameSocket = this;
-    // Backup reader: touching ev.data triggers the capture hook below
-    this.addEventListener('message', (ev) => ev.data, listenerOpts);
-    console.log('[board] socket captured; run loadAround() to fetch your area');
-  }
+  if (this.url.includes(config.net.socketUrlMatch) && gameSocket !== this) adoptSocket(this, 'first message');
   if (this !== gameSocket) return _origSend.call(this, data);
   stats.sent++;
   const ours = scriptSent.has(data);
@@ -340,11 +393,43 @@ Object.defineProperty(MessageEvent.prototype, 'data', {
     if (gameSocket && this.target === gameSocket && !seenEvents.has(this)) {
       seenEvents.add(this);
       stats.received++;
+      lastFrameAt = Date.now();
       enqueue(d, handleIncoming);
     }
     return d;
   },
 });
+
+// The server forgets every subscription when a connection ends, and patches sent
+// while it was down are lost, so the board kept for it can't be trusted any more.
+// Drop it all: the game resubscribes its view on the new connection and the solver
+// reloads whatever it needs. Frames still queued from the old connection are skipped.
+function resetConnection() {
+  connId++;
+  chunks.clear(); gameSubs.clear(); scriptChunks.clear(); chunkTouched.clear(); chunkVersion.clear();
+  pendingSnapshots.clear(); presumedEmpty.clear(); incompleteChunks.clear(); inFlight.clear();
+  probe = null;
+}
+
+function onSocketClosed(ws, ev) {
+  if (ws !== gameSocket) return;
+  stats.disconnects++;
+  lastClose = { code: ev.code, reason: ev.reason || '', clean: ev.wasClean, at: new Date() };
+  resetConnection();
+  console.warn(`[net] game connection closed (code ${ev.code}${ev.reason ? `: ${ev.reason}` : ''}); ` +
+    'board data dropped until the game reconnects');
+}
+
+// 1 = OPEN. Only then can anything be sent.
+const socketReady = () => !!gameSocket && gameSocket.readyState === 1;
+// Only a socket that is closing or closed counts as disconnected (2 = CLOSING, 3 = CLOSED)
+const socketOpen = () => !!gameSocket && gameSocket.readyState !== 2 && gameSocket.readyState !== 3;
+
+// Thrown by anything that needs the connection once it has closed
+class Disconnected extends Error {
+  constructor() { super('the game connection is closed'); this.name = 'Disconnected'; }
+}
+const isDisconnect = (e) => e instanceof Disconnected;
 
 // Copy the frame immediately so later hand-offs can't empty it
 function snapshot(data) {
@@ -362,17 +447,28 @@ function enqueue(data, handler, source) {
     if (stats.detached++ === 0) console.warn('[board] a frame was already detached; board may be missing updates');
     return;
   }
+  const conn = connId;
   queue = queue.then(async () => {
+    if (conn !== connId) return;              // from a connection that has since closed
     const bytes = copy instanceof Blob ? new Uint8Array(await copy.arrayBuffer()) : copy;
-    for (const [type, body] of fields(await gunzip(bytes))) handler(type, body, source);
+    const raw = await gunzip(bytes);
+    if (conn !== connId) return;
+    for (const [type, body] of fields(raw)) handler(type, body, source);
   }).catch((e) => { stats.errors++; stats.lastError = e; console.warn('[board] frame skipped:', e); });
 }
 
 // Send a frame this script built. It goes through the hook above, which logs it
 // as a script action; scriptSent marks it so it is not mistaken for your click.
+// Never writes to a closed socket (the browser only logs a warning and drops it,
+// so the solver would carry on blind): it throws Disconnected instead. It also
+// waits while the browser's send buffer is backed up, so a slow link can't make
+// messages pile up faster than the server takes them.
 async function sendScript(bytes) {
   if (!gameSocket) throw new Error(NO_SOCKET);
+  if (!socketReady()) throw new Disconnected();
   const gz = await gzip(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+  while (socketReady() && gameSocket.bufferedAmount > config.net.maxBufferedBytes) await sleep(20);
+  if (!socketReady()) throw new Disconnected();
   scriptSent.add(gz);
   gameSocket.send(gz);
 }
@@ -435,41 +531,62 @@ async function gunzip(bytes) {
 
 // ===========================================================================
 // 8. MESSAGE HANDLERS
+// The board comes from the game's tile feed (what it draws the board from):
+// 12 subscribe / 13 unsubscribe, 15 one full tile, 29 a batch of full tiles,
+// 16 a delta. Tiles are sent at the resolution asked for; only resolution 64
+// (one byte per cell) is usable, and each tile carries a version so an older
+// delta arriving after newer data can be recognised and dropped.
 // ===========================================================================
+
+// One full tile (a FullTile message): replaces the chunk
+function applyFullTile(b) {
+  const o = toObj(b);
+  if (!(o[3] instanceof Uint8Array) || o[3].length !== CHUNK * CHUNK) { stats.otherResolution++; return; }
+  const k = chunkKey(...readChunk(o[1]));
+  chunks.set(k, Uint8Array.from(o[3]));
+  chunkVersion.set(k, o[2] || 0);
+  pendingSnapshots.delete(k); presumedEmpty.delete(k); incompleteChunks.delete(k);
+  lastSnapshotAt = Date.now();
+  stats.snapshots++;
+}
 
 function handleIncoming(type, body) {
   if (type === 19) {                         // your profile, sent on connect
     const o = toObj(body);
     if (typeof o[5] === 'number') stats.score = o[5];
-  } else if (type === 8) {                    // result of one of your actions
+  } else if (type === 8) {                    // the server's answer to an action: 1 requestId, 2 ok
     const o = toObj(body);
     if (o[6] instanceof Uint8Array) { const r = toObj(o[6]); stats.score = r[1]; stats.lastPoints = r[2]; }
-  } else if (type === 29) {                   // full chunk snapshots
-    for (const [f, entry] of fields(body)) {
-      if (f !== 1) continue;
-      const o = toObj(entry);
-      const [cx, cy] = readChunk(o[1]);
-      if (o[3] && o[3].length === CHUNK * CHUNK) {
-        const k = chunkKey(cx, cy);
-        chunks.set(k, Uint8Array.from(o[3]));
-        pendingSnapshots.delete(k); presumedEmpty.delete(k); incompleteChunks.delete(k);
-        lastSnapshotAt = Date.now();
-        stats.snapshots++;
-      }
+    if (o[1] !== undefined && inFlight.delete(o[1])) {
+      if (o[2] === 1) stats.acksOk++; else stats.acksRejected++;
     }
-  } else if (type === 16) {                   // live patches: rectangles of new cell bytes
-    let grid = null;
+  } else if (type === 22) {                   // seeds, sent back for a seed request (used as a ping)
+    probe?.resolve();
+  } else if (type === 29) {                   // a batch of full tiles
+    for (const [f, entry] of fields(body)) if (f === 1) applyFullTile(entry);
+  } else if (type === 15) {                   // a single full tile
+    applyFullTile(body);
+  } else if (type === 16) {                   // a delta: 1 tile, 2 version, 3 rects, 4 resolution
+    let k = null, version = 0, resolution = CHUNK;
+    const rects = [];
     for (const [f, v] of fields(body)) {
-      if (f === 1) grid = chunks.get(chunkKey(...readChunk(v)));
-      if (f === 3 && !grid) stats.patchesForUnloadedChunks++;
-      if (f === 3 && grid) {
-        stats.patches++;
-        const r = toObj(v), x = r[1] || 0, y = r[2] || 0, w = r[3] || 0, h = r[4] || 0;
-        const data = r[5] instanceof Uint8Array ? r[5] : new Uint8Array(0);
-        for (let i = 0; i < data.length && i < w * h; i++)
-          grid[(y + Math.floor(i / w)) * CHUNK + x + (i % w)] = data[i];
-      }
+      if (f === 1) k = chunkKey(...readChunk(v));
+      else if (f === 2) version = v;
+      else if (f === 3) rects.push(v);
+      else if (f === 4) resolution = v || CHUNK;
     }
+    if (resolution !== CHUNK) { stats.otherResolution++; return; }   // the game zoomed out: not cell data
+    const grid = chunks.get(k);
+    if (!grid) { stats.patchesForUnloadedChunks += rects.length; return; }
+    if (version && version <= (chunkVersion.get(k) ?? 0)) { stats.staleDeltas++; return; }
+    for (const v of rects) {
+      stats.patches++;
+      const r = toObj(v), x = r[1] || 0, y = r[2] || 0, w = r[3] || 0, h = r[4] || 0;
+      const data = r[5] instanceof Uint8Array ? r[5] : new Uint8Array(0);
+      for (let i = 0; i < data.length && i < w * h; i++)
+        grid[(y + Math.floor(i / w)) * CHUNK + x + (i % w)] = data[i];
+    }
+    if (version) chunkVersion.set(k, version);
   }
 }
 
@@ -489,7 +606,7 @@ function handleOutgoing(type, body, source) {
       if (f !== 1) continue;
       const k = chunkKey(...readChunk(v));
       if (source === 'manual') { gameSubs.delete(k); presumedEmpty.delete(k); incompleteChunks.delete(k); }
-      chunks.delete(k);
+      chunks.delete(k); chunkVersion.delete(k);
     }
   } else if (type === 5) {                    // the game reporting where you are
     const o = toObj(body), [cx, cy] = readChunk(o[1]), idx = o[2] || 0;
@@ -586,6 +703,7 @@ async function waitForSnapshots(keys, { patient = false } = {}) {
   const silent = () => keys.filter((k) => pendingSnapshots.has(k));
   for (;;) {
     await sleep(25);
+    if (!socketOpen()) throw new Disconnected();          // nothing more will arrive
     await queue;                                          // process frames that already arrived
     const now = Date.now(), left = silent();
     let outcome = null;
@@ -644,9 +762,14 @@ const withPadding = ([x0, y0, x1, y1], pad = config.board.solverPadding) =>
 // Tell the server to stop sending these chunks and forget them locally. This is
 // what actually frees memory: the server stops pushing patches for them, the
 // handler for message 13 drops the cell data, and the game stops receiving them.
+// With the connection closed there is nothing to tell the server (it already forgot
+// every subscription), so only the local bookkeeping is cleared.
 async function unsubscribeChunks(keys) {
   if (!keys.length || !gameSocket) return;
-  await sendScript(bField(13, chunkListMsg(keys.map((k) => k.split(',').map(Number)))));
+  if (socketReady()) {
+    await sendScript(bField(13, chunkListMsg(keys.map((k) => k.split(',').map(Number)))))
+      .catch((e) => { if (!isDisconnect(e)) throw e; });
+  }
   for (const k of keys) {
     scriptChunks.delete(k); chunkTouched.delete(k);
     pendingSnapshots.delete(k); presumedEmpty.delete(k); incompleteChunks.delete(k);
@@ -948,8 +1071,44 @@ function buildAction([f4, f5], chunkX, chunkY, cellIndex, ts = Date.now()) {
   return new Uint8Array(bField(4, inner));
 }
 
-const sendAction = (action, chunkX, chunkY, col, row) =>
-  sendScript(buildAction(action, chunkX, chunkY, row * CHUNK + col));
+// The server answers every action (message 8) quoting its request id, so the bot
+// knows how many of its actions are still being worked on. Ids are made unique
+// (two actions in the same millisecond would otherwise share one).
+const nextRequestId = () => (lastRequestId = Math.max(Date.now(), lastRequestId + 1));
+
+// Actions unanswered after net.ackTimeout are given up on (Map order = send order)
+function expireAcks() {
+  const cutoff = Date.now() - config.net.ackTimeout;
+  for (const [id, at] of inFlight) {
+    if (at >= cutoff) break;
+    inFlight.delete(id);
+    stats.acksLost++;
+  }
+}
+
+// Flow control: when the server falls behind, wait for it instead of piling more
+// actions onto its queue (that backlog is what makes a long run grind to a halt)
+async function waitForAckRoom() {
+  while (config.net.maxInFlight) {
+    expireAcks();
+    if (inFlight.size < config.net.maxInFlight || stopRequested) return;
+    if (!socketReady()) throw new Disconnected();
+    await sleep(10);
+  }
+}
+
+async function sendAction(action, chunkX, chunkY, col, row) {
+  await waitForAckRoom();
+  const id = nextRequestId();
+  inFlight.set(id, Date.now());
+  try {
+    await sendScript(buildAction(action, chunkX, chunkY, row * CHUNK + col, id));
+  } catch (e) {
+    inFlight.delete(id);
+    throw e;
+  }
+  return id;
+}
 
 // Every action goes through act(): a simulated click when possible (so the game's
 // own UI - score, animations - stays in sync), otherwise a direct message.
@@ -966,6 +1125,69 @@ const chordGlobal  = (x, y) => act(ACTION.CHORD, x, y);
 const flagLocal    = (cx, cy, col, row) => flagGlobal(...toGlobal(cx, cy, col, row));
 const revealLocal  = (cx, cy, col, row) => revealGlobal(...toGlobal(cx, cy, col, row));
 const chordLocal   = (cx, cy, col, row) => chordGlobal(...toGlobal(cx, cy, col, row));
+
+// Is the server still answering? Asks for one chunk's seed (the game does this all
+// the time and the reply is harmless) and times the answer. Frames from other
+// players keep arriving even when the server has stopped handling this
+// connection's requests, so only a direct answer counts.
+async function probeConnection(timeout = config.net.probeTimeout) {
+  if (!socketReady()) return { ok: false, why: 'the socket is not open' };
+  const [cx, cy] = view ? [view.cx, view.cy] : [0, 0];
+  let resolve;
+  const answered = new Promise((r) => (resolve = r));
+  const mine = { resolve };
+  probe = mine;
+  const t0 = Date.now();
+  try {
+    await sendScript(bField(21, bField(1, chunkMsg(cx, cy))));
+  } catch (e) {
+    if (probe === mine) probe = null;
+    if (isDisconnect(e)) return { ok: false, why: 'the socket closed' };
+    throw e;
+  }
+  const got = await Promise.race([answered.then(() => true), sleep(timeout).then(() => false)]);
+  if (probe === mine) probe = null;
+  return got ? { ok: true, rtt: Date.now() - t0 } : { ok: false, why: `no answer within ${timeout} ms` };
+}
+
+// Health report: socket state, how far behind the server is on the bot's actions,
+// and a live probe. Returned as well as printed.
+async function checkConnection({ quiet = false } = {}) {
+  expireAcks();
+  const oldest = inFlight.size ? Date.now() - inFlight.values().next().value : 0;
+  const p = await probeConnection();
+  const verdict = !socketOpen() ? 'closed: wait for the game to reconnect, or run reconnect()'
+    : !p.ok ? 'open but not answering: run reconnect() to start a new connection'
+    : oldest > config.net.ackTimeout / 2 ? 'answering, but slow to process actions: raise solver.actionDelay'
+    : 'healthy';
+  const info = {
+    socket: gameSocket ? ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][gameSocket.readyState] : 'not captured',
+    probe: p.ok ? `answered in ${p.rtt} ms` : `FAILED (${p.why})`,
+    msSinceLastFrame: lastFrameAt ? Date.now() - lastFrameAt : null,
+    sendBufferBytes: gameSocket?.bufferedAmount ?? 0,
+    actionsAwaitingAnswer: inFlight.size,
+    oldestAwaitingMs: oldest,
+    acksOk: stats.acksOk, acksRejected: stats.acksRejected, acksLost: stats.acksLost,
+    staleDeltasDropped: stats.staleDeltas, otherResolutionTiles: stats.otherResolution,
+    disconnects: stats.disconnects, reconnects: stats.reconnects,
+    verdict,
+  };
+  if (!quiet) console.table(info);
+  return { ...info, probeOk: p.ok, rtt: p.rtt ?? null, healthy: verdict === 'healthy' };
+}
+
+// Start a new connection: close the game's socket; the game reconnects by itself
+// (after about a second) and the constructor hook picks the new socket up.
+async function reconnect({ timeout = config.net.reconnectTimeout, quiet = false } = {}) {
+  if (!gameSocket) throw new Error(NO_SOCKET);
+  if (socketOpen()) {
+    if (!quiet) console.log('[net] closing the game connection so the game opens a new one');
+    try { gameSocket.close(4000, 'msbot: reconnect'); } catch { gameSocket.close(); }
+  }
+  const ok = await waitForReconnect(timeout);
+  if (!quiet) console.log(ok ? '[net] new connection is up' : `[net] the game did not reconnect within ${timeout / 1000} s; reload the page`);
+  return ok;
+}
 
 // The game's score display doesn't pick up automated actions, but the server
 // sends your current totals whenever the game connects. resyncUI() drops the
@@ -1152,7 +1374,8 @@ async function runPass(rect, { delay = config.solver.actionDelay, passWait = con
     done.flags.filter((k) => getCell(...parseKey(k)).state !== 'flag').length +
     [...openCells].filter((k) => getCell(...parseKey(k)).state === 'hidden').length;
   const waitStart = Date.now();
-  do { await sleep(50); await queue; } while (pendingCount() > 0 && Date.now() - waitStart < passWait);
+  do { await sleep(50); await queue; } while (pendingCount() > 0 && Date.now() - waitStart < passWait && socketOpen());
+  if (!socketOpen()) throw new Disconnected();
 
   // What the board shows of this pass's actions right now (can be called again later)
   const tally = () => {
@@ -1226,21 +1449,34 @@ const WHY = (code) => ({
   hitMine: 'a reveal opened a mine, which a safe-move solver should never do, so it stopped. ' +
     'Look at the board around the last actions before running again',
   stalled: `actions were sent but the board never showed any of them taking effect (${config.solver.maxStalledPasses} passes ` +
-    `in a row, each given ${config.solver.confirmTimeout} ms). Rate limit, lag or a dead connection? Try a larger solver.actionDelay`,
-  disconnected: 'the game connection is closed. Wait for the game to reconnect (or reload the page), then run it again',
+    `in a row, each given ${config.solver.confirmTimeout} ms). Run checkConnection() to see whether the server still answers; ` +
+    'reconnect() starts a new connection. If it keeps happening, try a larger solver.actionDelay',
+  disconnected: `the game connection closed${lastClose ? ` (code ${lastClose.code}${lastClose.reason ? `: ${lastClose.reason}` : ''})` : ''}. ` +
+    'Wait for the game to reconnect (or reload the page), then run it again',
   unloaded: `the server sent nothing for this area's chunks within board.loadMaxWait (${config.board.loadMaxWait} ms), even after retrying`,
   maxPasses: `solver.maxPasses (${config.solver.maxPasses}) passes were used on this area; it may still have safe moves`,
 }[code]);
 
-// Only a socket that is closing or closed counts as disconnected (2 = CLOSING, 3 = CLOSED)
-const socketOpen = () => { try { return !!gameSocket && gameSocket.readyState !== 2 && gameSocket.readyState !== 3; } catch { return true; } };
+// Wait for the game to open a new connection (it reconnects by itself; the send hook
+// captures the new socket), then give it time to resubscribe its view.
+// True once a usable connection is back; false on timeout or stopSolve().
+async function waitForReconnect(timeout = config.net.reconnectTimeout) {
+  const deadline = Date.now() + timeout;
+  while (!socketReady() && !(solving && stopRequested) && Date.now() < deadline) await sleep(config.net.resyncPoll);
+  if (!socketReady()) return false;
+  await sleep(config.net.resyncSettle);
+  await queue;
+  if (!socketReady()) return false;
+  stats.reconnects++;
+  return true;
+}
 
 // After a pass that confirmed nothing, keep looking for ANY sign of life for up to
 // solver.confirmTimeout before calling it a stall (a lag spike is not a failure)
 async function awaitConfirmation(pass) {
   const until = Date.now() + config.solver.confirmTimeout;
   let check = pass.tally();
-  while (check.flagged + check.revealed === 0 && !check.hitMine.length && Date.now() < until && !stopRequested) {
+  while (check.flagged + check.revealed === 0 && !check.hitMine.length && Date.now() < until && !stopRequested && socketOpen()) {
     await sleep(50);
     await queue;
     check = pass.tally();
@@ -1252,37 +1488,55 @@ async function awaitConfirmation(pass) {
 // Returns { code, status, passes, flags, chords, reveals, hiddenLeft }; `code` is a key of STATUS.
 async function areaLoop(rect, { delay, passWait, maxPasses = config.solver.maxPasses, quiet = false } = {}) {
   const total = { passes: 0, flags: 0, chords: 0, reveals: 0 };
-  let code = 'maxPasses', stalled = 0, reloads = 0;
-  while (total.passes < maxPasses) {
-    if (stopRequested) { code = 'stopped'; break; }
-    if (!socketOpen()) { code = 'disconnected'; break; }
-    const pass = await runPass(rect, { delay, passWait, quiet: true });
-    const { plan, done } = pass;
-    let { check } = pass;
-    if (!planSize(plan)) {
-      if (!isSettled(rect)) {              // no moves, but only because some chunks never sent data
-        if (reloads++ < 2) { await reloadUnsettled(rect); continue; }
-        code = 'unloaded'; break;
+  let code = 'maxPasses', stalled = 0, reloads = 0, refreshes = 0;
+  try {
+    while (total.passes < maxPasses) {
+      if (stopRequested) { code = 'stopped'; break; }
+      if (!socketOpen()) { code = 'disconnected'; break; }
+      const acks0 = { ok: stats.acksOk, rejected: stats.acksRejected };
+      const pass = await runPass(rect, { delay, passWait, quiet: true });
+      const { plan, done } = pass;
+      let { check } = pass;
+      if (!planSize(plan)) {
+        if (!isSettled(rect)) {              // no moves, but only because some chunks never sent data
+          if (reloads++ < 2) { await reloadUnsettled(rect); continue; }
+          code = 'unloaded'; break;
+        }
+        code = countHidden(rect) === 0 ? 'solved' : 'stuck';
+        break;
       }
-      code = countHidden(rect) === 0 ? 'solved' : 'stuck';
-      break;
-    }
-    total.passes++;
-    total.flags += done.flags.length; total.chords += done.chords.length; total.reveals += done.reveals.length;
-    const sent = done.flags.length + done.chords.length + done.reveals.length;
-    if (!quiet) console.log(`[area] pass ${total.passes}: ${done.flags.length} flags, ` +
-      `${done.chords.length} chords, ${done.reveals.length} reveals`);
-    if (sent > 0 && !check.hitMine.length && check.flagged + check.revealed === 0) {
-      check = await awaitConfirmation(pass);
-      if (check.flagged + check.revealed === 0 && !check.hitMine.length) {
-        if (++stalled >= config.solver.maxStalledPasses) { code = 'stalled'; break; }
-        console.warn(`[area] pass ${total.passes}: nothing confirmed after ${config.solver.confirmTimeout} ms ` +
-          `(stalled pass ${stalled} of ${config.solver.maxStalledPasses}); planning again`);
-        continue;
+      total.passes++;
+      total.flags += done.flags.length; total.chords += done.chords.length; total.reveals += done.reveals.length;
+      const sent = done.flags.length + done.chords.length + done.reveals.length;
+      if (!quiet) console.log(`[area] pass ${total.passes}: ${done.flags.length} flags, ` +
+        `${done.chords.length} chords, ${done.reveals.length} reveals`);
+      if (sent > 0 && !check.hitMine.length && check.flagged + check.revealed === 0) {
+        check = await awaitConfirmation(pass);
+        if (!socketOpen()) { code = 'disconnected'; break; }   // not a stall: the connection went away
+        if (check.flagged + check.revealed === 0 && !check.hitMine.length) {
+          // The server answered these actions but the board never showed them: the
+          // bot's copy of the board stopped updating, not the connection. Fetch it again.
+          const ok = stats.acksOk - acks0.ok, rejected = stats.acksRejected - acks0.rejected;
+          if (ok + rejected > 0 && refreshes < config.solver.maxStalledPasses) {
+            refreshes++;
+            console.warn(`[area] pass ${total.passes}: the server answered ${ok + rejected} of ${sent} actions ` +
+              `(${rejected} rejected) but the board didn't change; reloading this area's chunks ` +
+              `(${refreshes} of ${config.solver.maxStalledPasses})`);
+            await loadChunks(chunksIn(...withPadding(rect)), { quiet: true });
+            continue;
+          }
+          if (++stalled >= config.solver.maxStalledPasses) { code = 'stalled'; break; }
+          console.warn(`[area] pass ${total.passes}: nothing confirmed after ${config.solver.confirmTimeout} ms ` +
+            `(stalled pass ${stalled} of ${config.solver.maxStalledPasses}); planning again`);
+          continue;
+        }
       }
+      stalled = 0; refreshes = 0;
+      if (check.hitMine.length) { code = 'hitMine'; break; }
     }
-    stalled = 0;
-    if (check.hitMine.length) { code = 'hitMine'; break; }
+  } catch (e) {
+    if (!isDisconnect(e)) throw e;
+    code = 'disconnected';                   // actions of the interrupted pass are not counted
   }
   const hiddenLeft = countHidden(rect);
   const status = STATUS[code];
@@ -1438,20 +1692,73 @@ async function autoSolve(size = config.solver.areaSize, {
   const step = Math.max(1, size - overlap);
   const areaState = new Map();                    // 'nearest' mode: "i,j" -> 'solved' | 'stuck'
   return exclusive(async () => {
-    const total = { areas: 0, flags: 0, chords: 0, reveals: 0 };
+    const total = { areas: 0, flags: 0, chords: 0, reveals: 0, recoveries: 0 };
     const started = Date.now();
     let end = { reason: 'error', detail: 'an exception was thrown (see the error above)' };
     let unloadedRow = 0;
+    let pace = delay ?? config.solver.actionDelay;  // ms between actions; slowed down after each reconnect
+    let recoveriesInRow = 0;                        // since the last area that finished normally
+
+    // The connection dropped or stalled. Work out which, fix it, and carry on more gently:
+    //   dropped                    -> wait for the game to reconnect
+    //   stalled, server answers    -> the board feed went stale: reload it after a short cool-down
+    //   stalled, server silent     -> the connection is dead in all but name: start a new one
+    // Returns false (and sets `end`) when the run has to stop instead.
+    const recover = async (kind) => {
+      const { autoRecover, maxRecoveries, reconnectTimeout, reconnectSlowdown, maxActionDelay, stallCooldown } = config.net;
+      end = { reason: kind, detail: WHY(kind) };
+      if (!autoRecover) return false;
+      if (recoveriesInRow >= maxRecoveries) {
+        end.detail += ` [gave up after ${recoveriesInRow} recoveries in a row without finishing an area (net.maxRecoveries)]`;
+        return false;
+      }
+      recoveriesInRow++;
+      const attempt = `(attempt ${recoveriesInRow} of ${maxRecoveries})`;
+      if (kind === 'stalled' && socketReady()) {
+        const p = await probeConnection();
+        if (p.ok) {
+          console.warn(`[auto] stalled, but the server answers (${p.rtt} ms): reloading the board after ` +
+            `${stallCooldown / 1000} s ${attempt}`);
+          await releaseChunks(viewChunks());
+          await sleep(stallCooldown);
+        } else {
+          console.warn(`[auto] stalled and the server did not answer a probe (${p.why}): starting a new connection ${attempt}`);
+          try { gameSocket.close(4000, 'msbot: unresponsive'); } catch { gameSocket.close(); }
+        }
+      }
+      if (!socketReady()) {
+        if (kind === 'disconnected')
+          console.warn(`[auto] connection lost; waiting up to ${reconnectTimeout / 1000} s for the game to reconnect ${attempt}`);
+        if (!(await waitForReconnect())) {
+          if (stopRequested) end = { reason: 'stopped', detail: WHY('stopped') };
+          else end.detail += ` [the game did not reconnect within ${reconnectTimeout / 1000} s (net.reconnectTimeout)]`;
+          return false;
+        }
+      }
+      if (stopRequested) { end = { reason: 'stopped', detail: WHY('stopped') }; return false; }
+      total.recoveries++;
+      pace = Math.max(pace, Math.min(maxActionDelay, Math.max(pace + 5, Math.round(pace * reconnectSlowdown))));
+      console.log(`[auto] recovered; resuming around ${here} with ${pace} ms between actions`);
+      return true;
+    };
+
     try {
       for (;;) {
         const rect = areaAround(here, size);
-        const r = await areaLoop(rect, { delay, passWait, maxPasses, quiet: true });
-        total.areas++;
+        const r = await areaLoop(rect, { delay: pace, passWait, maxPasses, quiet: true });
         total.flags += r.flags; total.chords += r.chords; total.reveals += r.reveals;
+        if (r.code === 'disconnected' || r.code === 'stalled') {   // fix the connection, then redo this area
+          console.log(`[auto] area ${total.areas + 1} ${rectText(rect)}: ${r.status}; ` +
+            `${r.flags} flags, ${r.chords} chords, ${r.reveals} reveals so far`);
+          if (await recover(r.code)) continue;
+          total.areas++;                            // the run ends on it: it still counts as worked on
+          break;
+        }
+        total.areas++;
         console.log(`[auto] area ${total.areas} ${rectText(rect)}: ${r.status}; ` +
           `${r.flags} flags, ${r.chords} chords, ${r.reveals} reveals (totals: ${total.flags} flags, ` +
           `${total.chords} chords, ${total.reveals} reveals)`);
-        if (['hitMine', 'stalled', 'disconnected', 'stopped'].includes(r.code)) { end = { reason: r.code, detail: WHY(r.code) }; break; }
+        if (['hitMine', 'stopped'].includes(r.code)) { end = { reason: r.code, detail: WHY(r.code) }; break; }
         if (r.code === 'maxPasses') console.warn(`[auto] ${WHY('maxPasses')}`);
         unloadedRow = r.code === 'unloaded' ? unloadedRow + 1 : 0;
         if (unloadedRow >= config.auto.maxUnloadedAreas) {
@@ -1461,7 +1768,6 @@ async function autoSolve(size = config.solver.areaSize, {
         }
         if (total.areas >= maxAreas) { end = { reason: 'maxAreas', detail: `reached the requested limit of ${maxAreas} areas` }; break; }
 
-        let next;
         if (mode === 'nearest') {
           if (r.code !== 'unloaded') areaState.set(`${grid[0]},${grid[1]}`, r.code === 'solved' ? 'solved' : 'stuck');
           // Work done here may unblock the overlapping neighbours: check them again
@@ -1470,16 +1776,28 @@ async function autoSolve(size = config.solver.areaSize, {
               const k = `${grid[0] + di},${grid[1] + dj}`;
               if ((di || dj) && areaState.get(k) === 'stuck') areaState.delete(k);
             }
-          next = await pickNearestToStart(start, size, step, areaState, maxRadius);
-        } else {
-          next = await pickNextArea(here, size, step, maxRings);
+        }
+        let next;
+        try {
+          next = mode === 'nearest'
+            ? await pickNearestToStart(start, size, step, areaState, maxRadius)
+            : await pickNextArea(here, size, step, maxRings);
+          if (!next.end) {
+            // Keep chunks around the next area and around your own view; drop the rest
+            const reach = size + 2 * (step + config.auto.keepMargin);
+            const keep = new Set(chunksIn(...areaAround(next.center, reach)).map(([a, b]) => chunkKey(a, b)));
+            for (const k of viewChunks()) keep.add(k);
+            await releaseChunks(keep);
+          }
+        } catch (e) {
+          if (!isDisconnect(e)) throw e;
+          // Lost while searching: once reconnected, the finished area is re-checked
+          // (quickly, it has no work left) and the search runs again from there
+          if (await recover('disconnected')) continue;
+          break;
         }
         if (next.end) { end = { reason: next.end, detail: next.detail }; break; }
-        // Keep chunks around the next area and around your own view; drop the rest
-        const reach = size + 2 * (step + config.auto.keepMargin);
-        const keep = new Set(chunksIn(...areaAround(next.center, reach)).map(([a, b]) => chunkKey(a, b)));
-        for (const k of viewChunks()) keep.add(k);
-        await releaseChunks(keep);
+        recoveriesInRow = 0;                        // an area was finished and the next one found
         console.log(`[auto] moving to ${next.center} (${next.work} safe moves waiting)`);
         here = next.center;
         if (next.grid) grid = next.grid;
@@ -1506,6 +1824,9 @@ function boardStatus() {
     socket: gameSocket ? ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][gameSocket.readyState] : 'not captured',
     ...stats,
     lastError: stats.lastError ? String(stats.lastError) : '',
+    sendBufferBytes: gameSocket ? gameSocket.bufferedAmount : 0,
+    actionsAwaitingAnswer: inFlight.size,
+    lastClose: lastClose ? `code ${lastClose.code}${lastClose.reason ? ` (${lastClose.reason})` : ''} at ${lastClose.at.toLocaleTimeString()}` : 'none',
     chunksLoaded: loaded.length,
     chunksSilentNow: `${presumedEmpty.size} presumed empty, ${incompleteChunks.size} unknown`,
     lastRun: lastRun ? `${lastRun.command}: ${lastRun.endReason} (${lastRun.detail})` : 'none yet',
@@ -1534,12 +1855,16 @@ const api = {
   // actions
   revealGlobal, flagGlobal, chordGlobal, revealLocal, flagLocal, chordLocal,
   sendAction, ACTION, resyncUI,
+  // network
+  checkConnection, probeConnection, reconnect,
   // solver
   planSolve, solveRadius, solveArea, autoSolve, stopSolve, areaAround, countHidden,
   // logs / internals
   actionLog, showActionLog, stats, dispose,
   waitForSnapshots, recheckSlowChunks, pendingSnapshots, presumedEmpty, incompleteChunks,
+  waitForReconnect,
   get lastRun() { return lastRun; },
+  get lastClose() { return lastClose; },
   get view() { return view; },
   get socket() { return gameSocket; },
 };
@@ -1549,7 +1874,7 @@ g.msbot = api;
 for (const name of [
   'loadAround', 'loadChunks', 'printArea', 'boardStatus', 'memoryStatus', 'cleanup', 'getCell', 'whereAmI',
   'revealGlobal', 'flagGlobal', 'chordGlobal', 'revealLocal', 'flagLocal', 'chordLocal',
-  'solveRadius', 'solveArea', 'autoSolve', 'stopSolve', 'resyncUI',
+  'solveRadius', 'solveArea', 'autoSolve', 'stopSolve', 'resyncUI', 'checkConnection', 'reconnect',
   'showActionLog', 'showConfig', 'setConfig', 'resetConfig', 'configDiff',
 ]) g[name] = api[name];
 g.botConfig = config;          // live settings; msbot.config is the same object
@@ -1570,6 +1895,8 @@ console.log('[msbot] ready. Scroll or click once, then: await loadAround(); awai
 //   await autoSolve(40, { mode: 'nearest' });// always the closest unfinished area to the start
 //   stopSolve();                            // stop any of these after the current action
 //   await resyncUI();                       // refresh the game's score display after solving
+//   await checkConnection();                // is the server still answering? how far behind is it?
+//   await reconnect();                      // make the game open a fresh connection
 //   boardStatus();                          // health check if the board looks wrong
 //   showActionLog();                        // table of every action sent this session
 //   setConfig({ solver: { actionDelay: 120, passWait: 500 } });   // gentler pacing

@@ -77,6 +77,16 @@ const DEFAULT_CONFIG = {
     resyncTimeout: 10000,
     resyncPoll: 200,
     resyncSettle: 1500,
+    maxBufferedBytes: 65536,
+    maxInFlight: 50,
+    ackTimeout: 5000,
+    probeTimeout: 3000,
+    autoRecover: true,
+    stallCooldown: 5000,
+    reconnectTimeout: 60000,
+    maxRecoveries: 10,
+    reconnectSlowdown: 1.5,
+    maxActionDelay: 100,
   },
 };
 /* DEFAULTS:END */

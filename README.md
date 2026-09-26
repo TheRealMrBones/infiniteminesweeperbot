@@ -22,6 +22,7 @@ commands.
 - [The solver](#the-solver)
 - [Click mode](#click-mode)
 - [Protocol notes](#protocol-notes)
+- [Network recovery](#network-recovery)
 - [Troubleshooting](#troubleshooting)
 - [Repo layout](#repo-layout)
 - [Developing](#developing)
@@ -72,6 +73,8 @@ unhooks the old one first.
 | `await chordGlobal(x, y)` | Chord a finished number (opens all its hidden neighbours at once). |
 | `await revealLocal(cx, cy, col, row)` | Same three, addressed by chunk + cell instead of global coordinates. |
 | `await resyncUI()` | Drop the socket so the game reconnects and refreshes its score display. No page reload. |
+| `await checkConnection()` | Network health: socket state, a live probe of the server (round-trip time), how many of the bot's actions still await an answer, answers ok / rejected / lost, and a one-line verdict. |
+| `await reconnect()` | Start a new connection: closes the game's socket; the game reopens it by itself and the bot follows. |
 | `showActionLog()` | Table of every action sent this session, yours and the bot's. |
 
 ### Solver
@@ -114,8 +117,8 @@ explanation, then a totals line, and keeps the summary in `msbot.lastRun`; the r
 | `blankGap` | `auto.giveUpAfterEmpty` rings/bands of areas in a row had nothing revealed in them (after a final re-check of slow chunks). The line says how far out it looked. | Raise `auto.giveUpAfterEmpty`, or start closer to the next revealed region with `{ center: [x, y] }`. |
 | `radiusLimit` / `ringLimit` | Everything within `auto.maxRadius` (`nearest`) or `auto.maxRings` (`mostWork`) was checked and has no safe move. | Raise the limit, or accept that the region is done. |
 | `chunksNotLoading` | The server sent nothing for chunks it should have (the run named how many areas or bands), even after retrying. | Check the connection and `boardStatus()`; raise `board.loadMaxWait`. |
-| `stalled` | Actions went out but the board never showed any of them taking effect, for `solver.maxStalledPasses` passes that each waited `solver.confirmTimeout`. | Rate limit, lag or a dead connection: raise `solver.actionDelay`, check `boardStatus()`. |
-| `disconnected` | The game WebSocket closed. | Wait for the game to reconnect or reload, re-paste, run again. |
+| `stalled` | Actions went out but the board never showed any of them taking effect, for `solver.maxStalledPasses` passes that each waited `solver.confirmTimeout`, and recovery (if on) didn't help within `net.maxRecoveries` tries. | `await checkConnection()` says whether the server still answers; `await reconnect()` starts a new connection. Raise `solver.actionDelay` if it keeps happening. |
+| `disconnected` | The game WebSocket closed and the game didn't reconnect within `net.reconnectTimeout`, the bot recovered more than `net.maxRecoveries` times in a row, or `net.autoRecover` is off. The line gives the close code. | Wait for the game to reconnect or reload, re-paste, run again. Raise `solver.actionDelay` if it keeps happening. |
 | `hitMine` | A reveal opened a mine. It should never happen. | Look at the board around the last actions before running again. |
 | `error` | An exception was thrown; the stack is in the console. | Report it with `msbot.stats`. |
 
@@ -218,6 +221,16 @@ into `config.defaults.js`). Run it whenever you change a default.
 | `net.resyncTimeout` | `10000` | ms to wait for the game to reconnect in `resyncUI()`. |
 | `net.resyncPoll` | `200` | ms between reconnect checks. |
 | `net.resyncSettle` | `1500` | ms to let the game resubscribe after reconnecting. |
+| `net.maxBufferedBytes` | `65536` | Sending pauses while this many bytes still wait in the browser's send buffer, so messages can't pile up faster than the server takes them. |
+| `net.maxInFlight` | `50` | At most this many of the bot's actions may await the server's answer; sending pauses beyond that, so a server that falls behind isn't buried (0 = no limit). |
+| `net.ackTimeout` | `5000` | ms after which an unanswered action is counted as lost (`acksLost`). |
+| `net.probeTimeout` | `3000` | ms to wait for the server to answer a probe (`checkConnection()`, stall recovery). |
+| `net.autoRecover` | `true` | `autoSolve()`: recover from a dropped or stalled connection (see [Network recovery](#network-recovery)) instead of ending the run. |
+| `net.stallCooldown` | `5000` | ms to pause before retrying a stalled area whose server still answers. |
+| `net.reconnectTimeout` | `60000` | ms to wait for the game to reconnect before the run ends as `disconnected`. |
+| `net.maxRecoveries` | `10` | The run ends after this many recoveries without finishing an area in between. |
+| `net.reconnectSlowdown` | `1.5` | After each recovery, the action delay for the rest of the run is multiplied by this (at least +5 ms)... |
+| `net.maxActionDelay` | `100` | ...but never raised above this many ms. |
 
 ## How it works
 
@@ -360,20 +373,30 @@ Incoming (top-level field number = message type):
 | Field | Meaning |
 | --- | --- |
 | 19 | Your profile on connect; field 5 is the score. |
-| 8 | Result of one of your actions; field 6 holds `{ 1: score, 2: points for this action }`. |
-| 29 | Full chunk snapshots: repeated field 1, each `{ 1: chunk coords, 3: 4096 cell bytes }`. |
-| 16 | Live patches: field 1 is the chunk, each field 3 is `{ 1: x, 2: y, 3: w, 4: h, 5: bytes }`. |
+| 8 | Answer to an action (`revealAck`): `{ 1: request id, 2: ok, 3: revealed cells, 4: flagged cell, 6: { 1: score, 2: points } }`. |
+| 29 | A batch of full tiles: repeated field 1, each a full tile as in 15. |
+| 15 | One full tile: `{ 1: chunk coords, 2: version, 3: cell bytes, 4: resolution }`. |
+| 16 | Tile delta: `{ 1: chunk, 2: version, 3: rect (repeated), 4: resolution }`, each rect `{ 1: x, 2: y, 3: w, 4: h, 5: bytes }`. |
+| 22 | Seed response (the bot's probe waits for one). |
 
 Outgoing:
 
 | Field | Meaning |
 | --- | --- |
 | 4 | Action: `{ 1: client timestamp (used as the request id), 2: chunk, 3: row * 64 + col, 4: 1 = flag, 5: 1 = chord }`. Reveal is neither flag nor chord. |
-| 12 | Subscribe to chunks (field 1 repeated, field 2 = 64). |
-| 13 | Unsubscribe from chunks. |
+| 12 | Subscribe to tiles (field 1 repeated, field 2 = resolution; the bot asks for 64 = one byte per cell). |
+| 13 | Unsubscribe from tiles. |
+| 21 | Seed request `{ 1: chunk (repeated) }`; the bot sends one as a harmless ping. |
 | 5 | The game reporting your view: `{ 1: chunk, 2: cell index, 3: width, 4: height }` in cells. |
 
 Other details:
+
+- **The tile feed is the game's own board feed.** The game's bundle names 12/13/15/16/29 `minimap*`, but at
+  resolution 64 they are exactly what it draws the board from. When you zoom out, the game asks for a
+  lower resolution; the bot ignores data at any resolution other than 64. Deltas carry a version and
+  older ones are dropped (the game does the same).
+- **Reconnecting**: when its socket closes, the game opens a new one after 1 s (doubling up to 10 s).
+  The bot hooks the `WebSocket` constructor so it follows the new socket the moment it is created.
 
 - **Cell byte**: `0` hidden, `1` revealed mine, `2`-`9` a number `0`-`7`, `10+` a flag whose colour
   is `value - 10` (one per player).
@@ -382,6 +405,26 @@ Other details:
   `chunk * 64 + offset` and can be negative — the world is infinite in all directions.
 - **Compression**: every frame in both directions is gzipped, via `CompressionStream` /
   `DecompressionStream`.
+
+## Network recovery
+
+A long run used to end in one of two ways even though the game itself kept working: the socket
+closed, or actions stopped showing up on the board ("stalled"). The bot now tells the causes apart:
+
+- **Every action is tracked until the server answers it** (message 8 quotes the request id). At most
+  `net.maxInFlight` may be unanswered; beyond that the bot waits, instead of piling actions onto a
+  server that has fallen behind.
+- **Answered, but not on the board**: the bot's copy of the board went stale (the connection is fine).
+  The area's chunks are reloaded and the pass is retried.
+- **Stalled anyway**: `autoSolve` probes the server. If it answers, the bot reloads the board, pauses
+  `net.stallCooldown` and retries; if it doesn't, it closes the socket so the game opens a new
+  connection, and carries on there.
+- **Socket closed**: the bot waits up to `net.reconnectTimeout` for the game's new connection
+  (picked up the moment the game creates it) and redoes the interrupted area.
+
+After each recovery the delay between actions grows by `net.reconnectSlowdown` (up to
+`net.maxActionDelay`). After `net.maxRecoveries` recoveries without finishing an area, the run
+ends and says why. `await checkConnection()` and `await reconnect()` do the same checks by hand.
 
 ## Troubleshooting
 
@@ -393,7 +436,8 @@ Other details:
 | `received` climbs but `snapshots` and `patches` stay `0` | The protocol changed, or the frames aren't being decoded. Check `stats.lastError`. |
 | `detached` is climbing | Frames arrived already emptied and the board may be missing updates. Reload and re-paste. |
 | `autoSolve` stops with "no area with a safe move found within range" | Nothing solvable within `maxRadius` / `maxRings`, or a blank gap wider than `auto.giveUpAfterEmpty` steps separates you from more work. Raise `giveUpAfterEmpty`, or move closer and pass `{ center: [x, y] }`. |
-| `autoSolve` ends `stalled` | Actions went out but never showed on the board, several passes in a row. Likely rate-limited or the socket dropped: slow down (`solver.actionDelay`) and check `boardStatus()`. |
+| `autoSolve` ends `stalled`, but you can keep playing by hand | The connection is fine; the bot's copy of the board or the server's handling of its actions fell behind. Recovery normally handles this (see [Network recovery](#network-recovery)); run `await checkConnection()` for details. Don't zoom the game out during a run: it switches the tiles the bot reads to a lower resolution. |
+| `WebSocket is already in CLOSING or CLOSED state` spam, runs dropping after a long time | The server closed the connection. `autoSolve` now waits for the game to reconnect and carries on at a slower pace, instead of sending into the dead socket. `boardStatus()` shows `disconnects`, `reconnects` and the last close code. If drops keep happening, raise `solver.actionDelay`. |
 | A run ended and you don't know why | `msbot.lastRun` and the `[auto] ENDED (...)` line say. See [How runs end](#how-runs-end). |
 | Tab gets slow over a long run | `memoryStatus()`; lower `memory.maxScriptChunks`, run `await cleanup()`, `console.clear()`, or `await resyncUI()`. See [Memory](#memory). |
 | Cells read `?` after a solver finished | `releaseOnFinish` freed them. `await loadAround()` again, or turn the setting off. |
